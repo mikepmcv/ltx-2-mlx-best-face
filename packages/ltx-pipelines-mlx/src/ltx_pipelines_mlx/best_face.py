@@ -20,9 +20,9 @@ Use --character-sheet for the character-sheet continuation checkpoint.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import random
 import time
+from pathlib import Path
 
 import mlx.core as mx
 from huggingface_hub import hf_hub_download
@@ -56,7 +56,7 @@ from .scheduler import ltx2_schedule
 from .ti2vid_one_stage import TI2VidOneStagePipeline
 from .ti2vid_two_stages import DEFAULT_CFG_SCALE
 from .utils.helpers import create_noised_state
-from .utils.media_io import DEFAULT_IMAGE_CRF, load_image_and_preprocess
+from .utils.media_io import load_image_and_preprocess
 from .utils.samplers import guided_denoise_loop
 
 _materialize = getattr(mx, "eval")
@@ -173,6 +173,8 @@ class BestFacePipeline(TI2VidOneStagePipeline):
             target_w=target_w,
         )
 
+        # Best Face/BFS feeds the resized reference directly to the VAE. Keep
+        # CRF=0 by default for parity; the flag exists only for experiments.
         ref_pixels = load_image_and_preprocess(reference, ref_h, ref_w, crf=crf)
         ref_pixels = ref_pixels[:, :, None, :, :]  # BCHW -> BCFHW with F=1
         ref_latent = self.vae_encoder.encode(ref_pixels)
@@ -224,7 +226,7 @@ class BestFacePipeline(TI2VidOneStagePipeline):
         resize_mode: str = "match_target",
         source_id: float = 2.0,
         phase_scale: float = 1.0,
-        reference_crf: int = DEFAULT_IMAGE_CRF,
+        reference_crf: int = 0,
     ) -> tuple[mx.array, mx.array]:
         """Generate an identity-preserving LTX video from one reference image."""
         if not prompt.lstrip().startswith("ref_t2v:"):
@@ -363,7 +365,7 @@ class BestFacePipeline(TI2VidOneStagePipeline):
         resize_mode: str = "match_target",
         source_id: float = 2.0,
         phase_scale: float = 1.0,
-        reference_crf: int = DEFAULT_IMAGE_CRF,
+        reference_crf: int = 0,
     ) -> str:
         video_latent, audio_latent = self.generate_best_face(
             prompt=prompt,
@@ -461,7 +463,12 @@ def main() -> None:
     parser.add_argument("--stg-scale", type=float, default=1.0)
     parser.add_argument("--source-id", type=float, default=2.0)
     parser.add_argument("--phase-scale", type=float, default=1.0)
-    parser.add_argument("--reference-crf", type=int, default=DEFAULT_IMAGE_CRF)
+    parser.add_argument(
+        "--reference-crf",
+        type=int,
+        default=0,
+        help="Optional H.264 preprocessing CRF for the identity reference (default: 0 = disabled, matching Best Face/BFS).",
+    )
     parser.add_argument("--seed", "-s", type=int, default=-1)
     parser.add_argument("--no-low-memory", action="store_true")
 
