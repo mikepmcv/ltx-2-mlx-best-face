@@ -1,20 +1,32 @@
 # Best Face ID on LTX-2 MLX
 
-This fork adds a native-MLX inference path for `Alissonerdx/LTX-Best-Face-ID` on Apple Silicon.
+This fork adds native-MLX inference for `Alissonerdx/LTX-Best-Face-ID` on Apple Silicon.
 
-The implementation uses the existing LTX-2.3 MLX model, VAE, distilled sampler, upsampler and LoRA loader. It adds the identity-specific inference mechanism that Best Face was trained with:
+The port adds the identity-specific inference mechanism Best Face was trained with:
 
-- reference image encoded with the LTX video VAE;
-- reference latent appended as separate tokens (not used as generated frame 0);
+- reference image encoded with the normal LTX video VAE;
+- reference latent appended as separate context tokens, not rendered frame-0 tokens;
 - reference tokens kept clean at timestep 0;
 - overlap T/H/W positions;
 - source-phase/TASS-RoPE tagging (`source_id=2`, `phase_scale=1` by default);
-- actual Best Face LoRA weights fused into the LTX transformer;
+- the actual Best Face LoRA weights fused into the LTX transformer;
 - reference tokens removed before upscaling/decoding.
 
-The optional ArcFace projector is not part of v1. The Best Face model author describes it as marginal; the main identity signal comes from the overlap reference latent, source-phase RoPE and LoRA.
+The optional ArcFace projector is not part of v1. Best Face's model card says it adds little on top of the overlap reference latent + LoRA. The ArcFace identity loss used during training is already reflected in the trained LoRA weights.
 
-## First test
+## Two test modes
+
+There are two pipelines on the branch.
+
+### 1. `best_face_exact` — run this first
+
+This is the parity-first recipe. It mirrors the Best Face author's published fast demo as closely as the current MLX stack allows:
+
+- LTX-2.3 dev transformer;
+- official LTX-2.3 distilled-1.1 LoRA at strength 1.0;
+- Best Face LoRA at strength 1.0;
+- the distilled two-stage 8-step + 3-step schedule;
+- native MLX overlap/source-phase reference conditioning.
 
 Use a clean, frontal, well-lit close-up/bust reference with one person and a clearly visible face.
 
@@ -22,6 +34,23 @@ Use a clean, frontal, well-lit close-up/bust reference with one person and a cle
 git checkout feature/best-face-mlx
 uv sync --all-extras
 
+uv run python -m ltx_pipelines_mlx.best_face_exact \
+  --reference /absolute/path/to/host.png \
+  --prompt "A person sits at a podcast desk speaking naturally toward the camera. Medium close-up, locked camera, subtle head motion and blinking, soft studio lighting, realistic skin texture." \
+  --frames 49 \
+  --frame-rate 24 \
+  -H 576 -W 768 \
+  --seed 42 \
+  -o best-face-exact.mp4
+```
+
+`ref_t2v:` is automatically prefixed when absent.
+
+### 2. `best_face` — compare speed after parity works
+
+This uses the standalone LTX-2.3 distilled checkpoint plus the Best Face LoRA. It should be a convenient/faster path, but it is intentionally the second test because the author's published demo instead uses dev + the official distilled LoRA.
+
+```bash
 uv run python -m ltx_pipelines_mlx.best_face \
   --reference /absolute/path/to/host.png \
   --prompt "A person sits at a podcast desk speaking naturally toward the camera. Medium close-up, locked camera, subtle head motion and blinking, soft studio lighting, realistic skin texture." \
@@ -29,29 +58,27 @@ uv run python -m ltx_pipelines_mlx.best_face \
   --frame-rate 24 \
   -H 576 -W 768 \
   --seed 42 \
-  -o best-face-test.mp4
+  -o best-face-fast.mp4
 ```
 
-`ref_t2v:` is automatically prefixed if it is not already present.
-
-The default generation path is LTX-2.3 distilled two-stage generation: normally 8 denoising steps at half resolution plus 3 full-resolution refinement steps.
+Run both with the same reference, prompt, dimensions and seed. The useful comparison is identity quality versus wall-clock time.
 
 ## Important prompt detail
 
-Best Face identity is strongly prompt-driven. For the closest match, include visible attributes from the reference near the beginning of the prompt: hair color/style, glasses, facial hair, face shape, eye color when clearly visible, and similar non-sensitive visual details.
+Best Face identity is strongly prompt-driven. For the closest match, put visible attributes from the reference near the beginning of the prompt: hair color/style, glasses, facial hair, face shape, eye color when clearly visible, and similar visual attributes.
 
 Example:
 
 ```text
-ref_t2v: A light-skinned adult person with short dark hair, brown eyes, rectangular glasses and light stubble sits at a podcast desk speaking naturally toward the camera. Medium close-up, locked camera, subtle head movement and blinking, soft studio lighting, realistic skin texture.
+ref_t2v: An adult person with short dark hair, brown eyes, rectangular glasses and light stubble sits at a podcast desk speaking naturally toward the camera. Medium close-up, locked camera, subtle head movement and blinking, soft studio lighting, realistic skin texture.
 ```
 
 ## Character-sheet mode
 
-The fork also supports the Best Face character-sheet continuation checkpoint:
+The character-sheet continuation checkpoint is also supported. Its reference should be the four-panel Best Face sheet and should stay at native resolution.
 
 ```bash
-uv run python -m ltx_pipelines_mlx.best_face \
+uv run python -m ltx_pipelines_mlx.best_face_exact \
   --character-sheet \
   --reference /absolute/path/to/character-sheet.png \
   --prompt "A person sits at a podcast desk speaking naturally toward the camera. Medium close-up, locked camera." \
@@ -61,9 +88,13 @@ uv run python -m ltx_pipelines_mlx.best_face \
   -o best-face-character-sheet.mp4
 ```
 
-Character-sheet mode preserves the reference at its native resolution instead of shrinking it to the target video bucket. For Best Face's published character-sheet checkpoint, use the reference-sheet dimensions/layout recommended by its model card.
+The published character-sheet checkpoint was trained with a wide four-panel sheet at its own fixed resolution, commonly 1536×1024. `--character-sheet` selects `native_resolution` automatically unless you explicitly override it.
+
+If character-sheet identity is weaker than desired, the Best Face model card suggests additionally mixing the base face LoRA at a low strength (around 0.2 or higher). That is available through `--extra-lora` and can be automated after the first parity test.
 
 ## Advanced controls
+
+Common controls:
 
 ```text
 --best-face-strength FLOAT
@@ -76,6 +107,13 @@ Character-sheet mode preserves the reference at its native resolution instead of
 --extra-lora PATH STRENGTH # repeatable
 ```
 
+`best_face_exact` also exposes:
+
+```text
+--distilled-lora PATH
+--distilled-lora-strength FLOAT  # default 1.0
+```
+
 ## v1 scope
 
 Included:
@@ -84,17 +122,20 @@ Included:
 - overlap reference conditioning;
 - source-phase/TASS-RoPE;
 - clean reference timesteps;
-- two-stage distilled generation;
+- parity-first dev + official distilled LoRA recipe;
+- standalone-distilled comparison path;
 - close-up and character-sheet adapters;
+- identity reference injection in both generation stages;
 - unit tests for source-phase math.
 
 Not yet included:
 
 - optional ArcFace projector;
 - Best Face-specific multimodal prompt enhancer;
+- reference-CFG extra pass;
 - external-audio A2V combined with Best Face;
 - previous-video continuation for long-form generation;
 - low-RAM block streaming with identity source-phase;
-- multi-reference/strata/sidecar reference layouts.
+- multi-reference/strata/sidecar layouts.
 
 The next milestone after visual identity parity is external-audio A2V + Best Face, followed by rolling video-prefix continuation for long-form podcast generation.
