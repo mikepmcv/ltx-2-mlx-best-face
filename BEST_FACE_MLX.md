@@ -133,6 +133,20 @@ Strengths must be between `0` and `1`. The first image is placed at pixel frame
 `0`; the last image is placed at pixel frame `--frames - 1`. These controls
 guide the endpoint compositions but do not copy pixels directly into the output.
 
+When an endpoint should guide only subject placement and background layout—not
+the person's face, texture, or color grade—use layout mode:
+
+```bash
+--first-frame /absolute/path/to/opening.png \
+--first-frame-mode layout \
+--first-frame-strength 0.3 \
+--keyframe-layout-blur 32
+```
+
+Layout mode desaturates and spatially blurs the keyframe before VAE encoding.
+This retains coarse silhouette, scale, screen position, and room geometry while
+leaving character identity and facial features to the Best Face reference.
+
 After a successful generation, a JSON sidecar is written beside the video as
 `<output>.json`. It records the resolved seed, prompt, model and LoRAs, reference
 and keyframe paths, strengths, dimensions, frame count, frame rate, and pipeline

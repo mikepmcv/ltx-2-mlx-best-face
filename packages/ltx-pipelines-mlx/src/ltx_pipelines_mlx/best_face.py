@@ -25,8 +25,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 from huggingface_hub import hf_hub_download
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape, snap_output_dimensions
 from ltx_core_mlx.conditioning.source_phase import SourcePhaseBlock, clear_source_phase, install_source_phase
@@ -39,7 +40,7 @@ from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_
 from .distilled import DistilledPipeline
 from .scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
 from .utils.helpers import create_noised_state
-from .utils.media_io import load_image_and_preprocess
+from .utils.media_io import load_image_and_preprocess, resize_and_center_crop
 from .utils.progress import phase
 from .utils.samplers import denoise_loop
 
@@ -76,6 +77,32 @@ def _write_generation_metadata(output_path: str, metadata: dict[str, object]) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def _prepare_keyframe_image(
+    image_path: str,
+    height: int,
+    width: int,
+    *,
+    mode: str,
+    layout_blur: float,
+) -> Image.Image:
+    """Prepare an appearance keyframe or a low-frequency layout-only guide."""
+    if mode not in {"appearance", "layout"}:
+        raise ValueError("keyframe mode must be appearance or layout")
+    if layout_blur < 0:
+        raise ValueError("keyframe layout blur must be non-negative")
+
+    with Image.open(image_path) as source:
+        image = resize_and_center_crop(source.convert("RGB"), height, width)
+    if mode == "layout":
+        # Retain silhouette, scale, screen position, and room geometry while
+        # suppressing face/texture identity and strong color grading. Scale the
+        # blur with encoding width so half/full stages see equivalent structure.
+        image = ImageEnhance.Color(image).enhance(0.1)
+        radius = layout_blur * width / 1024.0
+        image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+    return image
 
 
 class BestFacePipeline(DistilledPipeline):
@@ -240,10 +267,26 @@ class BestFacePipeline(DistilledPipeline):
         )
         return condition, block
 
-    def _encode_keyframe(self, image: str, height: int, width: int) -> mx.array:
+    def _encode_keyframe(
+        self,
+        image: str,
+        height: int,
+        width: int,
+        *,
+        mode: str,
+        layout_blur: float,
+    ) -> mx.array:
         """VAE-encode one framing keyframe and return its spatial tokens."""
         assert self.vae_encoder is not None
-        pixels = load_image_and_preprocess(image, height, width, crf=0)
+        prepared = _prepare_keyframe_image(
+            image,
+            height,
+            width,
+            mode=mode,
+            layout_blur=layout_blur,
+        )
+        array = np.asarray(prepared, dtype=np.float32) / 255.0
+        pixels = mx.array(array * 2.0 - 1.0).transpose(2, 0, 1)[None, ...].astype(mx.bfloat16)
         latent = self.vae_encoder.encode(pixels[:, :, None, :, :])
         tokens = latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, latent.shape[1])
         _materialize(tokens)
@@ -256,8 +299,10 @@ class BestFacePipeline(DistilledPipeline):
         last_frame: str | None,
         first_frame_strength: float,
         last_frame_strength: float,
+        first_frame_mode: str,
+        last_frame_mode: str,
         num_frames: int,
-    ) -> list[tuple[str, int, float]]:
+    ) -> list[tuple[str, int, float, str]]:
         for name, strength in (
             ("first_frame_strength", first_frame_strength),
             ("last_frame_strength", last_frame_strength),
@@ -267,11 +312,15 @@ class BestFacePipeline(DistilledPipeline):
         if num_frames < 1:
             raise ValueError("num_frames must be at least 1")
 
-        specs: list[tuple[str, int, float]] = []
+        for mode in (first_frame_mode, last_frame_mode):
+            if mode not in {"appearance", "layout"}:
+                raise ValueError("keyframe mode must be appearance or layout")
+
+        specs: list[tuple[str, int, float, str]] = []
         if first_frame is not None:
-            specs.append((first_frame, 0, first_frame_strength))
+            specs.append((first_frame, 0, first_frame_strength, first_frame_mode))
         if last_frame is not None:
-            specs.append((last_frame, num_frames - 1, last_frame_strength))
+            specs.append((last_frame, num_frames - 1, last_frame_strength, last_frame_mode))
         return specs
 
     @staticmethod
@@ -314,6 +363,9 @@ class BestFacePipeline(DistilledPipeline):
         last_frame: str | None = None,
         first_frame_strength: float = 1.0,
         last_frame_strength: float = 1.0,
+        first_frame_mode: str = "appearance",
+        last_frame_mode: str = "appearance",
+        keyframe_layout_blur: float = 32.0,
     ) -> tuple[mx.array, mx.array]:
         """Generate a Best Face video using LTX's fast distilled 8+3 flow."""
         if not prompt.lstrip().startswith("ref_t2v:"):
@@ -339,6 +391,8 @@ class BestFacePipeline(DistilledPipeline):
             last_frame=last_frame,
             first_frame_strength=first_frame_strength,
             last_frame_strength=last_frame_strength,
+            first_frame_mode=first_frame_mode,
+            last_frame_mode=last_frame_mode,
             num_frames=num_frames,
         )
 
@@ -366,8 +420,18 @@ class BestFacePipeline(DistilledPipeline):
             crf=reference_crf,
         )
         encoded_keyframes_1 = [
-            (self._encode_keyframe(path, H_half * 32, W_half * 32), frame_idx, strength)
-            for path, frame_idx, strength in keyframe_specs
+            (
+                self._encode_keyframe(
+                    path,
+                    H_half * 32,
+                    W_half * 32,
+                    mode=mode,
+                    layout_blur=keyframe_layout_blur,
+                ),
+                frame_idx,
+                strength,
+            )
+            for path, frame_idx, strength, mode in keyframe_specs
         ]
         keyframes_1 = self._build_keyframe_conditionings(
             encoded_keyframes_1,
@@ -447,8 +511,18 @@ class BestFacePipeline(DistilledPipeline):
             crf=reference_crf,
         )
         encoded_keyframes_2 = [
-            (self._encode_keyframe(path, H_full * 32, W_full * 32), frame_idx, strength)
-            for path, frame_idx, strength in keyframe_specs
+            (
+                self._encode_keyframe(
+                    path,
+                    H_full * 32,
+                    W_full * 32,
+                    mode=mode,
+                    layout_blur=keyframe_layout_blur,
+                ),
+                frame_idx,
+                strength,
+            )
+            for path, frame_idx, strength, mode in keyframe_specs
         ]
         keyframes_2 = self._build_keyframe_conditionings(
             encoded_keyframes_2,
@@ -535,6 +609,9 @@ class BestFacePipeline(DistilledPipeline):
         last_frame: str | None = None,
         first_frame_strength: float = 1.0,
         last_frame_strength: float = 1.0,
+        first_frame_mode: str = "appearance",
+        last_frame_mode: str = "appearance",
+        keyframe_layout_blur: float = 32.0,
     ) -> str:
         video_latent, audio_latent = self.generate_best_face(
             prompt=prompt,
@@ -555,6 +632,9 @@ class BestFacePipeline(DistilledPipeline):
             last_frame=last_frame,
             first_frame_strength=first_frame_strength,
             last_frame_strength=last_frame_strength,
+            first_frame_mode=first_frame_mode,
+            last_frame_mode=last_frame_mode,
+            keyframe_layout_blur=keyframe_layout_blur,
         )
         saved_path = self._decode_and_save_video(
             video_latent,
@@ -577,6 +657,9 @@ class BestFacePipeline(DistilledPipeline):
                 "last_frame": str(Path(last_frame).expanduser().resolve()) if last_frame else None,
                 "first_frame_strength": first_frame_strength,
                 "last_frame_strength": last_frame_strength,
+                "first_frame_mode": first_frame_mode,
+                "last_frame_mode": last_frame_mode,
+                "keyframe_layout_blur": keyframe_layout_blur,
                 "height": effective_height,
                 "width": effective_width,
                 "num_frames": num_frames,
@@ -670,6 +753,18 @@ def main() -> None:
     )
     parser.add_argument("--first-frame-strength", type=float, default=1.0)
     parser.add_argument("--last-frame-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--first-frame-mode",
+        choices=["appearance", "layout"],
+        default="appearance",
+        help="Use layout to retain composition while suppressing face and color appearance.",
+    )
+    parser.add_argument(
+        "--last-frame-mode",
+        choices=["appearance", "layout"],
+        default="appearance",
+    )
+    parser.add_argument("--keyframe-layout-blur", type=float, default=32.0)
 
     args = parser.parse_args()
     if args.seed < 0:
@@ -723,6 +818,9 @@ def main() -> None:
         last_frame=args.last_frame,
         first_frame_strength=args.first_frame_strength,
         last_frame_strength=args.last_frame_strength,
+        first_frame_mode=args.first_frame_mode,
+        last_frame_mode=args.last_frame_mode,
+        keyframe_layout_blur=args.keyframe_layout_blur,
     )
     print(f"Saved {Path(args.output)} in {time.time() - t0:.1f}s")
 

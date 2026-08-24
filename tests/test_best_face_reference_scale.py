@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -8,6 +9,7 @@ from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyfra
 from ltx_pipelines_mlx.best_face import (
     BestFacePipeline,
     _metadata_path,
+    _prepare_keyframe_image,
     _write_generation_metadata,
 )
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
@@ -66,10 +68,15 @@ def test_keyframe_specs_use_first_and_last_pixel_frames():
         last_frame="ending.png",
         first_frame_strength=1.0,
         last_frame_strength=0.75,
+        first_frame_mode="layout",
+        last_frame_mode="appearance",
         num_frames=145,
     )
 
-    assert specs == [("opening.png", 0, 1.0), ("ending.png", 144, 0.75)]
+    assert specs == [
+        ("opening.png", 0, 1.0, "layout"),
+        ("ending.png", 144, 0.75, "appearance"),
+    ]
 
 
 @pytest.mark.parametrize("strength", [-0.01, 1.01])
@@ -80,8 +87,30 @@ def test_keyframe_specs_reject_invalid_strength(strength: float):
             last_frame=None,
             first_frame_strength=strength,
             last_frame_strength=1.0,
+            first_frame_mode="appearance",
+            last_frame_mode="appearance",
             num_frames=49,
         )
+
+
+def test_layout_keyframe_suppresses_texture_and_color(tmp_path: Path):
+    source = np.zeros((64, 64, 3), dtype=np.uint8)
+    source[:, :32, 0] = 255
+    source[:, 32:, 2] = 255
+    path = tmp_path / "layout.png"
+    Image.fromarray(source).save(path)
+
+    appearance = np.asarray(
+        _prepare_keyframe_image(str(path), 64, 64, mode="appearance", layout_blur=16)
+    ).astype(np.float32)
+    layout = np.asarray(
+        _prepare_keyframe_image(str(path), 64, 64, mode="layout", layout_blur=16)
+    ).astype(np.float32)
+
+    assert layout.std() < appearance.std()
+    assert np.abs(layout[..., 0] - layout[..., 2]).mean() < np.abs(
+        appearance[..., 0] - appearance[..., 2]
+    ).mean()
 
 
 def test_generation_metadata_is_written_beside_output(tmp_path: Path):

@@ -156,6 +156,18 @@ def main() -> None:
     )
     parser.add_argument("--first-frame-strength", type=float, default=1.0)
     parser.add_argument("--last-frame-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--first-frame-mode",
+        choices=["appearance", "layout"],
+        default="appearance",
+        help="Use layout to retain composition while suppressing face and color appearance.",
+    )
+    parser.add_argument(
+        "--last-frame-mode",
+        choices=["appearance", "layout"],
+        default="appearance",
+    )
+    parser.add_argument("--keyframe-layout-blur", type=float, default=32.0)
 
     args = parser.parse_args()
     if args.seed < 0:
@@ -211,6 +223,9 @@ def main() -> None:
         last_frame=args.last_frame,
         first_frame_strength=args.first_frame_strength,
         last_frame_strength=args.last_frame_strength,
+        first_frame_mode=args.first_frame_mode,
+        last_frame_mode=args.last_frame_mode,
+        keyframe_layout_blur=args.keyframe_layout_blur,
     )
     print(f"Saved {Path(args.output)} in {time.time() - t0:.1f}s")
 
