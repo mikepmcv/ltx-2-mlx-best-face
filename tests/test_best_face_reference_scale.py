@@ -8,6 +8,8 @@ from PIL import Image
 
 from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
 from ltx_pipelines_mlx.best_face import (
+    OFFICIAL_BASE_FACE_STRENGTH,
+    OFFICIAL_SPATIAL_UPSCALER_FILE,
     BestFacePipeline,
     _metadata_path,
     _prepare_keyframe_image,
@@ -181,9 +183,32 @@ def test_best_face_exact_uses_published_character_sheet_defaults():
     signature = inspect.signature(BestFaceExactPipeline.__init__)
 
     assert signature.parameters["distilled_lora_strength"].default == 0.6
+    assert signature.parameters["base_face_strength"].default == 0.2
+    assert OFFICIAL_BASE_FACE_STRENGTH == 0.2
+    assert OFFICIAL_SPATIAL_UPSCALER_FILE == "spatial_upscaler_x2_v1_1.safetensors"
     assert OFFICIAL_DISTILLED_LORA_STRENGTH == 0.6
     assert OFFICIAL_STAGE2_SIGMAS == [0.85, 0.725, 0.421875, 0.0]
     assert OFFICIAL_NEGATIVE_PROMPT == (
         "pc game, console game, video game, cartoon, childish, ugly, artifacts, "
         "low resolution, blurry, jagged edges"
     )
+
+
+def test_best_face_exact_orders_official_character_sheet_loras(tmp_path: Path):
+    pipe = BestFaceExactPipeline(
+        model_dir=str(tmp_path),
+        best_face_lora="character.safetensors",
+        best_face_strength=1.0,
+        base_face_lora="base.safetensors",
+        base_face_strength=0.2,
+        distilled_lora="distilled.safetensors",
+        distilled_lora_strength=0.6,
+        spatial_upscaler="spatial_upscaler_x2_v1_1.safetensors",
+    )
+
+    assert pipe._pending_loras == [
+        ("distilled.safetensors", 0.6),
+        ("base.safetensors", 0.2),
+        ("character.safetensors", 1.0),
+    ]
+    assert pipe._spatial_upscaler_path == "spatial_upscaler_x2_v1_1.safetensors"

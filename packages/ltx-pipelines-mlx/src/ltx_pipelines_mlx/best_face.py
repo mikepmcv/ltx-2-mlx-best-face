@@ -51,6 +51,8 @@ DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"
 BEST_FACE_REPO = "Alissonerdx/LTX-Best-Face-ID"
 BEST_FACE_FILE = "Best_FaceID_v1.0_LoRA.safetensors"
 BEST_FACE_CHARACTER_SHEET_FILE = "Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors"
+OFFICIAL_BASE_FACE_STRENGTH = 0.2
+OFFICIAL_SPATIAL_UPSCALER_FILE = "spatial_upscaler_x2_v1_1.safetensors"
 
 
 def _resolve_adapter_spec(spec: str) -> str:
@@ -129,6 +131,9 @@ class BestFacePipeline(DistilledPipeline):
         gemma_model_id: str = DEFAULT_GEMMA,
         best_face_lora: str,
         best_face_strength: float = 1.0,
+        base_face_lora: str | None = None,
+        base_face_strength: float = OFFICIAL_BASE_FACE_STRENGTH,
+        spatial_upscaler: str | None = None,
         extra_loras: list[tuple[str, float]] | None = None,
         low_memory: bool = True,
     ):
@@ -142,12 +147,14 @@ class BestFacePipeline(DistilledPipeline):
             tile_count=None,
         )
 
-        loras: list[tuple[str, float]] = [
-            (_resolve_adapter_spec(best_face_lora), float(best_face_strength))
-        ]
+        loras: list[tuple[str, float]] = []
+        if base_face_lora is not None and base_face_strength != 0:
+            loras.append((_resolve_adapter_spec(base_face_lora), float(base_face_strength)))
+        loras.append((_resolve_adapter_spec(best_face_lora), float(best_face_strength)))
         for path, strength in extra_loras or []:
             loras.append((_resolve_adapter_spec(path), float(strength)))
         self._pending_loras = loras
+        self._spatial_upscaler_path = spatial_upscaler
 
     @staticmethod
     def _reference_size(
@@ -687,6 +694,7 @@ class BestFacePipeline(DistilledPipeline):
                 "source_id": source_id,
                 "phase_scale": phase_scale,
                 "model": str(self.model_dir),
+                "spatial_upscaler": self._spatial_upscaler_path,
                 "loras": [
                     {"path": str(path), "strength": strength}
                     for path, strength in self._pending_loras
@@ -718,6 +726,19 @@ def main() -> None:
         help="Local path, single-file HF repo, or repo::filename; defaults to Best Face v1.",
     )
     parser.add_argument("--best-face-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--base-face-lora",
+        default=None,
+        help="Override the base Face-ID LoRA stacked with --character-sheet.",
+    )
+    parser.add_argument(
+        "--base-face-strength", type=float, default=OFFICIAL_BASE_FACE_STRENGTH
+    )
+    parser.add_argument(
+        "--spatial-upscaler",
+        default=None,
+        help="Select an exact converted MLX spatial-upscaler file.",
+    )
     parser.add_argument(
         "--extra-lora",
         action="append",
@@ -788,6 +809,12 @@ def main() -> None:
         args.seed = random.randint(0, 2**31 - 1)
 
     lora_spec = args.best_face_lora or _default_best_face_spec(args.character_sheet)
+    base_face_lora = args.base_face_lora
+    if args.character_sheet and base_face_lora is None:
+        base_face_lora = _default_best_face_spec(False)
+    spatial_upscaler = args.spatial_upscaler
+    if args.character_sheet and spatial_upscaler is None:
+        spatial_upscaler = OFFICIAL_SPATIAL_UPSCALER_FILE
     resize_mode = args.resize_mode or (
         "native_resolution" if args.character_sheet else "match_target"
     )
@@ -798,6 +825,9 @@ def main() -> None:
         gemma_model_id=args.gemma,
         best_face_lora=lora_spec,
         best_face_strength=args.best_face_strength,
+        base_face_lora=base_face_lora,
+        base_face_strength=args.base_face_strength,
+        spatial_upscaler=spatial_upscaler,
         extra_loras=extra_loras,
         low_memory=not args.no_low_memory,
     )
@@ -808,6 +838,10 @@ def main() -> None:
     print(f"  reference: {args.reference}")
     print(f"  resize mode: {resize_mode}")
     print(f"  reference scale: {args.reference_scale:g}")
+    if base_face_lora:
+        print(f"  base Face-ID LoRA: {base_face_lora} (strength {args.base_face_strength:g})")
+    print(f"  character Face-ID LoRA: {lora_spec} (strength {args.best_face_strength:g})")
+    print(f"  spatial upscaler: {spatial_upscaler or 'auto'}")
     print(f"  source phase: source_id={args.source_id:g}, scale={args.phase_scale:g}")
     print(f"  seed: {args.seed}")
     if args.first_frame:
