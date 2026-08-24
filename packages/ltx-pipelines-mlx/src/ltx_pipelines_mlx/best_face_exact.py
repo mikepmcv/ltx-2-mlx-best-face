@@ -127,6 +127,12 @@ def main() -> None:
         choices=["match_target", "native_resolution"],
         default=None,
     )
+    parser.add_argument(
+        "--reference-scale",
+        type=float,
+        default=1.0,
+        help="Downscale the reference before VAE encoding while preserving its H/W position span.",
+    )
     parser.add_argument("--height", "-H", type=int, default=576)
     parser.add_argument("--width", "-W", type=int, default=768)
     parser.add_argument("--frames", "-f", type=int, default=49)
@@ -165,6 +171,7 @@ def main() -> None:
     print(f"  model: {args.model}")
     print(f"  reference: {args.reference}")
     print(f"  resize mode: {resize_mode}")
+    print(f"  reference scale: {args.reference_scale:g}")
     print(f"  source phase: source_id={args.source_id:g}, scale={args.phase_scale:g}")
     print(f"  seed: {args.seed}")
 
@@ -180,6 +187,7 @@ def main() -> None:
         stage1_steps=args.stage1_steps,
         stage2_steps=args.stage2_steps,
         resize_mode=resize_mode,
+        reference_scale=args.reference_scale,
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,

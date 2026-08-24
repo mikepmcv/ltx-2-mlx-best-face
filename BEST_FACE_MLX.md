@@ -81,6 +81,7 @@ The character-sheet continuation checkpoint is also supported. Its reference sho
 uv run python -m ltx_pipelines_mlx.best_face_exact \
   --character-sheet \
   --reference /absolute/path/to/character-sheet.png \
+  --reference-scale 0.5 \
   --prompt "A person sits at a podcast desk speaking naturally toward the camera. Medium close-up, locked camera." \
   --frames 49 \
   -H 576 -W 768 \
@@ -88,7 +89,7 @@ uv run python -m ltx_pipelines_mlx.best_face_exact \
   -o best-face-character-sheet.mp4
 ```
 
-The published character-sheet checkpoint was trained with a wide four-panel sheet at its own fixed resolution, commonly 1536×1024. `--character-sheet` selects `native_resolution` automatically unless you explicitly override it.
+The published character-sheet checkpoint was trained with a wide four-panel sheet at its own fixed resolution, commonly 1536×1024. `--character-sheet` selects `native_resolution` automatically unless you explicitly override it. `--reference-scale 0.5` encodes that sheet at 768×512, reducing its reference token count by roughly 75%, while scaling its H/W positions back to preserve the original 1536×1024 positional span. The default scale is `1.0` for backward compatibility.
 
 If character-sheet identity is weaker than desired, the Best Face model card suggests additionally mixing the base face LoRA at a low strength (around 0.2 or higher). That is available through `--extra-lora` and can be automated after the first parity test.
 
@@ -101,6 +102,7 @@ Common controls:
 --source-id FLOAT          # default 2
 --phase-scale FLOAT        # default 1
 --resize-mode match_target|native_resolution
+--reference-scale FLOAT    # (0, 1], default 1.0; lower uses fewer reference tokens
 --reference-crf INT        # default 0; direct reference-to-VAE path
 --stage1-steps INT
 --stage2-steps INT

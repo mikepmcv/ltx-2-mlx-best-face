@@ -59,8 +59,8 @@ def _resolve_adapter_spec(spec: str) -> str:
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
-def _round32(value: int) -> int:
-    return max(32, int(round(value / 32.0)) * 32)
+def _round32(value: float) -> int:
+    return max(32, round(value / 32.0) * 32)
 
 
 class BestFacePipeline(DistilledPipeline):
@@ -125,6 +125,41 @@ class BestFacePipeline(DistilledPipeline):
             src_w, src_h = image.size
         return _round32(src_h), _round32(src_w)
 
+    @classmethod
+    def _scaled_reference_geometry(
+        cls,
+        reference: str,
+        *,
+        resize_mode: str,
+        target_h: int,
+        target_w: int,
+        reference_scale: float,
+    ) -> tuple[int, int, float, float]:
+        """Return VAE input size and spatial position multipliers.
+
+        The reference is encoded at the scaled size, while the position
+        multipliers keep its H/W RoPE coordinates spanning the same area as
+        the unscaled reference. Ratios are derived from the rounded sizes so
+        non-exact scales still preserve the original span.
+        """
+        if not 0.0 < reference_scale <= 1.0:
+            raise ValueError("reference_scale must be greater than 0 and at most 1")
+
+        original_h, original_w = cls._reference_size(
+            reference,
+            resize_mode=resize_mode,
+            target_h=target_h,
+            target_w=target_w,
+        )
+        encoded_h = _round32(original_h * reference_scale)
+        encoded_w = _round32(original_w * reference_scale)
+        return (
+            encoded_h,
+            encoded_w,
+            original_h / encoded_h,
+            original_w / encoded_w,
+        )
+
     def _build_identity_conditioning(
         self,
         *,
@@ -132,6 +167,7 @@ class BestFacePipeline(DistilledPipeline):
         resize_mode: str,
         target_h: int,
         target_w: int,
+        reference_scale: float,
         frame_rate: float,
         num_generation_tokens: int,
         source_id: float,
@@ -140,11 +176,12 @@ class BestFacePipeline(DistilledPipeline):
     ) -> tuple[VideoConditionByReferenceLatent, SourcePhaseBlock]:
         assert self.vae_encoder is not None
 
-        ref_h, ref_w = self._reference_size(
+        ref_h, ref_w, position_scale_h, position_scale_w = self._scaled_reference_geometry(
             reference,
             resize_mode=resize_mode,
             target_h=target_h,
             target_w=target_w,
+            reference_scale=reference_scale,
         )
 
         # Best Face/BFS feeds the resized reference straight to the LTX VAE.
@@ -164,6 +201,14 @@ class BestFacePipeline(DistilledPipeline):
             ref_h_lat,
             ref_w_lat,
             frame_rate=frame_rate,
+        )
+        ref_positions = mx.concatenate(
+            [
+                ref_positions[..., :1],
+                ref_positions[..., 1:2] * position_scale_h,
+                ref_positions[..., 2:3] * position_scale_w,
+            ],
+            axis=-1,
         )
         _materialize(ref_tokens, ref_positions)
 
@@ -193,6 +238,7 @@ class BestFacePipeline(DistilledPipeline):
         stage1_steps: int | None = None,
         stage2_steps: int | None = None,
         resize_mode: str = "match_target",
+        reference_scale: float = 1.0,
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
@@ -233,6 +279,7 @@ class BestFacePipeline(DistilledPipeline):
             resize_mode=resize_mode,
             target_h=H_half * 32,
             target_w=W_half * 32,
+            reference_scale=reference_scale,
             frame_rate=frame_rate,
             num_generation_tokens=generation_tokens_1,
             source_id=source_id,
@@ -304,6 +351,7 @@ class BestFacePipeline(DistilledPipeline):
             resize_mode=resize_mode,
             target_h=H_full * 32,
             target_w=W_full * 32,
+            reference_scale=reference_scale,
             frame_rate=frame_rate,
             num_generation_tokens=generation_tokens_2,
             source_id=source_id,
@@ -382,6 +430,7 @@ class BestFacePipeline(DistilledPipeline):
         stage1_steps: int | None = None,
         stage2_steps: int | None = None,
         resize_mode: str = "match_target",
+        reference_scale: float = 1.0,
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
@@ -397,6 +446,7 @@ class BestFacePipeline(DistilledPipeline):
             stage1_steps=stage1_steps,
             stage2_steps=stage2_steps,
             resize_mode=resize_mode,
+            reference_scale=reference_scale,
             source_id=source_id,
             phase_scale=phase_scale,
             reference_crf=reference_crf,
@@ -448,6 +498,12 @@ def main() -> None:
         choices=["match_target", "native_resolution"],
         default=None,
     )
+    parser.add_argument(
+        "--reference-scale",
+        type=float,
+        default=1.0,
+        help="Downscale the reference before VAE encoding while preserving its H/W position span.",
+    )
     parser.add_argument("--height", "-H", type=int, default=576)
     parser.add_argument("--width", "-W", type=int, default=768)
     parser.add_argument("--frames", "-f", type=int, default=49)
@@ -489,6 +545,7 @@ def main() -> None:
     print(f"  model: {args.model}")
     print(f"  reference: {args.reference}")
     print(f"  resize mode: {resize_mode}")
+    print(f"  reference scale: {args.reference_scale:g}")
     print(f"  source phase: source_id={args.source_id:g}, scale={args.phase_scale:g}")
     print(f"  seed: {args.seed}")
 
@@ -504,6 +561,7 @@ def main() -> None:
         stage1_steps=args.stage1_steps,
         stage2_steps=args.stage2_steps,
         resize_mode=resize_mode,
+        reference_scale=args.reference_scale,
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,
