@@ -12,6 +12,7 @@ import mlx.core as mx
 from mlx_arsenal.diffusion import euler_step
 from tqdm import tqdm
 
+from ltx_core_mlx.components.diffusion_steps import EulerCfgPpDiffusionStep
 from ltx_core_mlx.components.guiders import MultiModalGuiderFactory
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState, apply_denoise_mask
 from ltx_core_mlx.guidance.perturbations import (
@@ -187,6 +188,110 @@ def denoise_loop(
 
     aggressive_cleanup()
 
+    return DenoiseOutput(video_latent=video_x, audio_latent=audio_x)
+
+
+def euler_ancestral_cfg_pp_denoise_loop(
+    model: X0Model,
+    video_state: LatentState,
+    audio_state: LatentState,
+    video_text_embeds: mx.array,
+    audio_text_embeds: mx.array,
+    negative_video_text_embeds: mx.array,
+    negative_audio_text_embeds: mx.array,
+    sigmas: list[float],
+    show_progress: bool = True,
+    on_step: OnStepFn | None = None,
+) -> DenoiseOutput:
+    """Run ComfyUI's ``euler_ancestral_cfg_pp`` sampler at CFG 1.
+
+    CFG++ still requires the unconditional prediction when CFG is one: the
+    conditioned prediction is the denoised target while the unconditional
+    prediction supplies the ODE direction.  This is the sampler used by the
+    published Best Face character-sheet workflow for its full-resolution pass.
+    """
+    video_positions = video_state.positions
+    audio_positions = audio_state.positions
+    video_attention_mask = video_state.attention_mask
+    audio_attention_mask = audio_state.attention_mask
+    video_x = video_state.latent
+    audio_x = audio_state.latent
+    video_uniform = _is_uniform_mask(video_state.denoise_mask)
+    audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
+    sigma_array = mx.array(sigmas, dtype=mx.float32)
+    diffusion_step = EulerCfgPpDiffusionStep(eta=1.0, s_noise=1.0)
+    steps = list(zip(sigmas[:-1], sigmas[1:]))
+    iterator = tqdm(steps, desc="Denoising (Euler ancestral CFG++)", disable=not show_progress)
+
+    for step_idx, (sigma, _sigma_next) in enumerate(iterator):
+        sigma_value = mx.broadcast_to(mx.array([sigma], dtype=mx.bfloat16), (video_x.shape[0],))
+        common_kwargs: dict = dict(
+            video_latent=video_x,
+            audio_latent=audio_x,
+            sigma=sigma_value,
+            video_positions=video_positions,
+            audio_positions=audio_positions,
+            video_attention_mask=video_attention_mask,
+            audio_attention_mask=audio_attention_mask,
+        )
+        if not video_uniform:
+            common_kwargs["video_timesteps"] = _compute_per_token_timesteps(
+                sigma, video_state.denoise_mask
+            )
+        if not audio_uniform:
+            common_kwargs["audio_timesteps"] = _compute_per_token_timesteps(
+                sigma, audio_state.denoise_mask
+            )
+
+        cond_video_x0, cond_audio_x0 = model(
+            **common_kwargs,
+            video_text_embeds=video_text_embeds,
+            audio_text_embeds=audio_text_embeds,
+        )
+        uncond_video_x0, uncond_audio_x0 = model(
+            **common_kwargs,
+            video_text_embeds=negative_video_text_embeds,
+            audio_text_embeds=negative_audio_text_embeds,
+        )
+        cond_video_x0 = apply_denoise_mask(
+            cond_video_x0, video_state.clean_latent, video_state.denoise_mask
+        )
+        cond_audio_x0 = apply_denoise_mask(
+            cond_audio_x0, audio_state.clean_latent, audio_state.denoise_mask
+        )
+        uncond_video_x0 = apply_denoise_mask(
+            uncond_video_x0, video_state.clean_latent, video_state.denoise_mask
+        )
+        uncond_audio_x0 = apply_denoise_mask(
+            uncond_audio_x0, audio_state.clean_latent, audio_state.denoise_mask
+        )
+
+        if on_step is not None:
+            on_step(step_idx, len(steps), cond_video_x0, sigma)
+
+        # K-diffusion uses ordinary Gaussian noise here. Reference/endpoint
+        # tokens must receive none, otherwise ancestral injection corrupts them.
+        video_noise = mx.random.normal(video_x.shape).astype(video_x.dtype) * video_state.denoise_mask
+        audio_noise = mx.random.normal(audio_x.shape).astype(audio_x.dtype) * audio_state.denoise_mask
+        video_x = diffusion_step.step(
+            video_x,
+            cond_video_x0,
+            sigma_array,
+            step_idx,
+            uncond_denoised=uncond_video_x0,
+            noise=video_noise,
+        )
+        audio_x = diffusion_step.step(
+            audio_x,
+            cond_audio_x0,
+            sigma_array,
+            step_idx,
+            uncond_denoised=uncond_audio_x0,
+            noise=audio_noise,
+        )
+        mx.async_eval(video_x, audio_x)
+
+    aggressive_cleanup()
     return DenoiseOutput(video_latent=video_x, audio_latent=audio_x)
 
 

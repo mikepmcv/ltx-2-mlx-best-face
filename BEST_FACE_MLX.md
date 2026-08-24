@@ -23,7 +23,7 @@ There are two pipelines on the branch.
 This is the parity-first recipe. It mirrors the Best Face author's published fast demo as closely as the current MLX stack allows:
 
 - LTX-2.3 dev transformer;
-- official LTX-2.3 distilled-1.1 LoRA at strength 1.0;
+- official LTX-2.3 distilled-1.1 LoRA at strength 0.6;
 - Best Face LoRA at strength 1.0;
 - the distilled two-stage 8-step + 3-step schedule;
 - native MLX overlap/source-phase reference conditioning.
@@ -113,7 +113,7 @@ Common controls:
 
 ```text
 --distilled-lora PATH
---distilled-lora-strength FLOAT  # default 1.0
+--distilled-lora-strength FLOAT  # default 0.6
 ```
 
 ### First/last-frame guidance

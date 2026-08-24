@@ -4,9 +4,9 @@ This variant mirrors the Best Face author's published fast demo recipe more
 closely than :mod:`ltx_pipelines_mlx.best_face`:
 
 - LTX-2.3 dev transformer;
-- official LTX-2.3 distilled-1.1 LoRA at strength 1.0;
+- official LTX-2.3 distilled-1.1 LoRA at strength 0.6;
 - Best Face ID LoRA at strength 1.0;
-- the same distilled 8-step + 3-step two-stage schedule;
+- Euler stage 1 and Euler ancestral CFG++ stage 2 at CFG 1;
 - native MLX identity-overlap/source-phase conditioning.
 
 The sibling ``best_face`` module uses the standalone distilled checkpoint as a
@@ -30,6 +30,13 @@ from .best_face import (
     _resolve_adapter_spec,
 )
 
+OFFICIAL_DISTILLED_LORA_STRENGTH = 0.6
+OFFICIAL_STAGE2_SIGMAS = [0.85, 0.725, 0.421875, 0.0]
+OFFICIAL_NEGATIVE_PROMPT = (
+    "pc game, console game, video game, cartoon, childish, ugly, artifacts, "
+    "low resolution, blurry, jagged edges"
+)
+
 
 class BestFaceExactPipeline(BestFacePipeline):
     """Best Face with dev + official distilled LoRA, matching the author recipe."""
@@ -42,7 +49,7 @@ class BestFaceExactPipeline(BestFacePipeline):
         best_face_lora: str,
         best_face_strength: float = 1.0,
         distilled_lora: str | None = None,
-        distilled_lora_strength: float = 1.0,
+        distilled_lora_strength: float = OFFICIAL_DISTILLED_LORA_STRENGTH,
         extra_loras: list[tuple[str, float]] | None = None,
         low_memory: bool = True,
     ):
@@ -72,6 +79,9 @@ class BestFaceExactPipeline(BestFacePipeline):
         # The published recipe fuses the official distillation adapter first,
         # then the identity adapter. Keep that ordering explicit.
         self._pending_loras.insert(0, (distilled_lora, float(distilled_lora_strength)))
+        self._best_face_cfg_pp = True
+        self._best_face_stage2_sigmas = OFFICIAL_STAGE2_SIGMAS
+        self._best_face_negative_prompt = OFFICIAL_NEGATIVE_PROMPT
 
     def load(self) -> None:
         """Load dev transformer + both LoRAs, then VAE encoder and upsampler."""
@@ -113,7 +123,9 @@ def main() -> None:
         default=None,
         help="Override the official distilled LoRA; accepts local path or repo::filename.",
     )
-    parser.add_argument("--distilled-lora-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--distilled-lora-strength", type=float, default=OFFICIAL_DISTILLED_LORA_STRENGTH
+    )
     parser.add_argument(
         "--extra-lora",
         action="append",
@@ -240,4 +252,9 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["BestFaceExactPipeline"]
+__all__ = [
+    "OFFICIAL_DISTILLED_LORA_STRENGTH",
+    "OFFICIAL_NEGATIVE_PROMPT",
+    "OFFICIAL_STAGE2_SIGMAS",
+    "BestFaceExactPipeline",
+]

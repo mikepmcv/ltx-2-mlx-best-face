@@ -42,7 +42,7 @@ from .scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
 from .utils.helpers import create_noised_state
 from .utils.media_io import load_image_and_preprocess, resize_and_center_crop
 from .utils.progress import phase
-from .utils.samplers import denoise_loop
+from .utils.samplers import denoise_loop, euler_ancestral_cfg_pp_denoise_loop
 
 _materialize = getattr(mx, "eval")  # noqa: B009 -- MLX graph materialiser
 
@@ -371,11 +371,18 @@ class BestFacePipeline(DistilledPipeline):
         if not prompt.lstrip().startswith("ref_t2v:"):
             prompt = "ref_t2v: " + prompt.strip()
 
-        # Positive text only: distilled pipeline has no CFG branch.
+        # The official character-sheet refine pass uses CFG++ at CFG 1. Its
+        # unconditional prediction still controls the sampler direction.
         self._load_text_encoder()
         with phase("Encoding prompt", verbose=self.verbose):
             video_embeds, audio_embeds = self._encode_text(prompt)
             _materialize(video_embeds, audio_embeds)
+            if getattr(self, "_best_face_cfg_pp", False):
+                negative_prompt = getattr(self, "_best_face_negative_prompt", "")
+                neg_video_embeds, neg_audio_embeds = self._encode_text(negative_prompt)
+                _materialize(neg_video_embeds, neg_audio_embeds)
+            else:
+                neg_video_embeds = neg_audio_embeds = None
         if self.low_memory:
             self.prompt_encoder.free()
             aggressive_cleanup()
@@ -537,7 +544,8 @@ class BestFacePipeline(DistilledPipeline):
             aggressive_cleanup()
 
         video_tokens, _ = self.video_patchifier.patchify(video_upscaled)
-        sigmas_2 = STAGE_2_SIGMAS[: stage2_steps + 1] if stage2_steps else STAGE_2_SIGMAS
+        stage2_schedule = getattr(self, "_best_face_stage2_sigmas", STAGE_2_SIGMAS)
+        sigmas_2 = stage2_schedule[: stage2_steps + 1] if stage2_steps else stage2_schedule
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)
@@ -566,7 +574,7 @@ class BestFacePipeline(DistilledPipeline):
         install_source_phase(self.dit, [phase_2], theta=float(self.dit.config.rope_theta))
         self._pre_denoise_flush(video_state_2, audio_state_2)
         try:
-            output_2 = denoise_loop(
+            stage2_kwargs = dict(
                 model=x0_model,
                 video_state=video_state_2,
                 audio_state=audio_state_2,
@@ -575,6 +583,15 @@ class BestFacePipeline(DistilledPipeline):
                 sigmas=sigmas_2,
                 on_step=self._stepwise_hook(F, H_full, W_full, stage=2),
             )
+            if getattr(self, "_best_face_cfg_pp", False):
+                assert neg_video_embeds is not None and neg_audio_embeds is not None
+                output_2 = euler_ancestral_cfg_pp_denoise_loop(
+                    **stage2_kwargs,
+                    negative_video_text_embeds=neg_video_embeds,
+                    negative_audio_text_embeds=neg_audio_embeds,
+                )
+            else:
+                output_2 = denoise_loop(**stage2_kwargs)
         finally:
             clear_source_phase(self.dit)
 
