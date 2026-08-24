@@ -144,6 +144,18 @@ def main() -> None:
     parser.add_argument("--reference-crf", type=int, default=0)
     parser.add_argument("--seed", "-s", type=int, default=-1)
     parser.add_argument("--no-low-memory", action="store_true")
+    parser.add_argument(
+        "--first-frame",
+        default=None,
+        help="Optional image guiding the opening composition at pixel frame 0.",
+    )
+    parser.add_argument(
+        "--last-frame",
+        default=None,
+        help="Optional image guiding the final composition at the last pixel frame.",
+    )
+    parser.add_argument("--first-frame-strength", type=float, default=1.0)
+    parser.add_argument("--last-frame-strength", type=float, default=1.0)
 
     args = parser.parse_args()
     if args.seed < 0:
@@ -174,6 +186,10 @@ def main() -> None:
     print(f"  reference scale: {args.reference_scale:g}")
     print(f"  source phase: source_id={args.source_id:g}, scale={args.phase_scale:g}")
     print(f"  seed: {args.seed}")
+    if args.first_frame:
+        print(f"  first frame: {args.first_frame} (strength {args.first_frame_strength:g})")
+    if args.last_frame:
+        print(f"  last frame: {args.last_frame} (strength {args.last_frame_strength:g})")
 
     pipe.generate_and_save_best_face(
         prompt=args.prompt,
@@ -191,6 +207,10 @@ def main() -> None:
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,
+        first_frame=args.first_frame,
+        last_frame=args.last_frame,
+        first_frame_strength=args.first_frame_strength,
+        last_frame_strength=args.last_frame_strength,
     )
     print(f"Saved {Path(args.output)} in {time.time() - t0:.1f}s")
 

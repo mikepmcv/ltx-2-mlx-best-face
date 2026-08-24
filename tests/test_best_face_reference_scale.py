@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from ltx_pipelines_mlx.best_face import BestFacePipeline
+from ltx_pipelines_mlx.best_face import (
+    BestFacePipeline,
+    _metadata_path,
+    _write_generation_metadata,
+)
 
 
 def test_reference_scale_halves_vae_size_and_preserves_position_span(tmp_path: Path):
@@ -51,3 +55,39 @@ def test_reference_scale_rejects_invalid_values(tmp_path: Path, scale: float):
             target_w=768,
             reference_scale=scale,
         )
+
+
+def test_keyframe_specs_use_first_and_last_pixel_frames():
+    specs = BestFacePipeline._keyframe_specs(
+        first_frame="opening.png",
+        last_frame="ending.png",
+        first_frame_strength=1.0,
+        last_frame_strength=0.75,
+        num_frames=145,
+    )
+
+    assert specs == [("opening.png", 0, 1.0), ("ending.png", 144, 0.75)]
+
+
+@pytest.mark.parametrize("strength", [-0.01, 1.01])
+def test_keyframe_specs_reject_invalid_strength(strength: float):
+    with pytest.raises(ValueError, match="strength"):
+        BestFacePipeline._keyframe_specs(
+            first_frame="opening.png",
+            last_frame=None,
+            first_frame_strength=strength,
+            last_frame_strength=1.0,
+            num_frames=49,
+        )
+
+
+def test_generation_metadata_is_written_beside_output(tmp_path: Path):
+    output = tmp_path / "clip.mp4"
+    metadata_path = _write_generation_metadata(
+        str(output),
+        {"seed": 123, "prompt": "test"},
+    )
+
+    assert metadata_path == _metadata_path(str(output))
+    assert metadata_path.name == "clip.mp4.json"
+    assert metadata_path.read_text(encoding="utf-8") == '{\n  "prompt": "test",\n  "seed": 123\n}\n'

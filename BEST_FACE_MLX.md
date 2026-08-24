@@ -116,6 +116,28 @@ Common controls:
 --distilled-lora-strength FLOAT  # default 1.0
 ```
 
+### First/last-frame guidance
+
+Both Best Face commands can anchor the opening and closing composition with
+images. The images are VAE-encoded at each generation stage and appended as
+clean keyframe tokens alongside the identity reference:
+
+```bash
+--first-frame /absolute/path/to/opening.png \
+--last-frame /absolute/path/to/ending.png \
+--first-frame-strength 1.0 \
+--last-frame-strength 0.9
+```
+
+Strengths must be between `0` and `1`. The first image is placed at pixel frame
+`0`; the last image is placed at pixel frame `--frames - 1`. These controls
+guide the endpoint compositions but do not copy pixels directly into the output.
+
+After a successful generation, a JSON sidecar is written beside the video as
+`<output>.json`. It records the resolved seed, prompt, model and LoRAs, reference
+and keyframe paths, strengths, dimensions, frame count, frame rate, and pipeline
+settings needed to reproduce the run.
+
 ## v1 scope
 
 Included:

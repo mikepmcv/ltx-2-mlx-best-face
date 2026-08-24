@@ -18,8 +18,10 @@ Run:
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import mlx.core as mx
@@ -28,6 +30,7 @@ from PIL import Image
 
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape, snap_output_dimensions
 from ltx_core_mlx.conditioning.source_phase import SourcePhaseBlock, clear_source_phase, install_source_phase
+from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
 from ltx_core_mlx.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.utils.memory import aggressive_cleanup
@@ -61,6 +64,18 @@ def _resolve_adapter_spec(spec: str) -> str:
 
 def _round32(value: float) -> int:
     return max(32, round(value / 32.0) * 32)
+
+
+def _metadata_path(output_path: str) -> Path:
+    return Path(f"{output_path}.json")
+
+
+def _write_generation_metadata(output_path: str, metadata: dict[str, object]) -> Path:
+    """Write reproducibility metadata beside a successfully generated video."""
+    path = _metadata_path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 class BestFacePipeline(DistilledPipeline):
@@ -225,6 +240,59 @@ class BestFacePipeline(DistilledPipeline):
         )
         return condition, block
 
+    def _encode_keyframe(self, image: str, height: int, width: int) -> mx.array:
+        """VAE-encode one framing keyframe and return its spatial tokens."""
+        assert self.vae_encoder is not None
+        pixels = load_image_and_preprocess(image, height, width, crf=0)
+        latent = self.vae_encoder.encode(pixels[:, :, None, :, :])
+        tokens = latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, latent.shape[1])
+        _materialize(tokens)
+        return tokens
+
+    @staticmethod
+    def _keyframe_specs(
+        *,
+        first_frame: str | None,
+        last_frame: str | None,
+        first_frame_strength: float,
+        last_frame_strength: float,
+        num_frames: int,
+    ) -> list[tuple[str, int, float]]:
+        for name, strength in (
+            ("first_frame_strength", first_frame_strength),
+            ("last_frame_strength", last_frame_strength),
+        ):
+            if not 0.0 <= strength <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+        if num_frames < 1:
+            raise ValueError("num_frames must be at least 1")
+
+        specs: list[tuple[str, int, float]] = []
+        if first_frame is not None:
+            specs.append((first_frame, 0, first_frame_strength))
+        if last_frame is not None:
+            specs.append((last_frame, num_frames - 1, last_frame_strength))
+        return specs
+
+    @staticmethod
+    def _build_keyframe_conditionings(
+        encoded: list[tuple[mx.array, int, float]],
+        *,
+        spatial_dims: tuple[int, int, int],
+        frame_rate: float,
+    ) -> list[VideoConditionByKeyframeIndex]:
+        return [
+            VideoConditionByKeyframeIndex(
+                frame_idx=frame_idx,
+                keyframe_latent=tokens,
+                spatial_dims=spatial_dims,
+                frame_rate=frame_rate,
+                strength=strength,
+                num_pixel_frames=1,
+            )
+            for tokens, frame_idx, strength in encoded
+        ]
+
     def generate_best_face(
         self,
         prompt: str,
@@ -242,6 +310,10 @@ class BestFacePipeline(DistilledPipeline):
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
+        first_frame: str | None = None,
+        last_frame: str | None = None,
+        first_frame_strength: float = 1.0,
+        last_frame_strength: float = 1.0,
     ) -> tuple[mx.array, mx.array]:
         """Generate a Best Face video using LTX's fast distilled 8+3 flow."""
         if not prompt.lstrip().startswith("ref_t2v:"):
@@ -262,6 +334,13 @@ class BestFacePipeline(DistilledPipeline):
         assert self.upsampler is not None
 
         height, width = snap_output_dimensions(height, width, two_stage=True)
+        keyframe_specs = self._keyframe_specs(
+            first_frame=first_frame,
+            last_frame=last_frame,
+            first_frame_strength=first_frame_strength,
+            last_frame_strength=last_frame_strength,
+            num_frames=num_frames,
+        )
 
         # ---------------- Stage 1: half resolution, normally 8 steps ----------------
         half_h, half_w = height // 2, width // 2
@@ -286,10 +365,19 @@ class BestFacePipeline(DistilledPipeline):
             phase_scale=phase_scale,
             crf=reference_crf,
         )
+        encoded_keyframes_1 = [
+            (self._encode_keyframe(path, H_half * 32, W_half * 32), frame_idx, strength)
+            for path, frame_idx, strength in keyframe_specs
+        ]
+        keyframes_1 = self._build_keyframe_conditionings(
+            encoded_keyframes_1,
+            spatial_dims=(F, H_half, W_half),
+            frame_rate=frame_rate,
+        )
 
         video_state_1 = create_noised_state(
             base_shape=video_shape,
-            conditionings=[identity_1],
+            conditionings=[identity_1, *keyframes_1],
             spatial_dims=(F, H_half, W_half),
             positions=video_positions_1,
             seed=seed,
@@ -358,6 +446,15 @@ class BestFacePipeline(DistilledPipeline):
             phase_scale=phase_scale,
             crf=reference_crf,
         )
+        encoded_keyframes_2 = [
+            (self._encode_keyframe(path, H_full * 32, W_full * 32), frame_idx, strength)
+            for path, frame_idx, strength in keyframe_specs
+        ]
+        keyframes_2 = self._build_keyframe_conditionings(
+            encoded_keyframes_2,
+            spatial_dims=(F, H_full, W_full),
+            frame_rate=frame_rate,
+        )
 
         if self.low_memory:
             # Both stage-2 reference tokens and upscaled latent are materialized.
@@ -372,7 +469,7 @@ class BestFacePipeline(DistilledPipeline):
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)
         video_state_2 = create_noised_state(
             base_shape=video_tokens.shape,
-            conditionings=[identity_2],
+            conditionings=[identity_2, *keyframes_2],
             spatial_dims=(F, H_full, W_full),
             positions=video_positions_2,
             seed=seed + 2,
@@ -434,6 +531,10 @@ class BestFacePipeline(DistilledPipeline):
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
+        first_frame: str | None = None,
+        last_frame: str | None = None,
+        first_frame_strength: float = 1.0,
+        last_frame_strength: float = 1.0,
     ) -> str:
         video_latent, audio_latent = self.generate_best_face(
             prompt=prompt,
@@ -450,13 +551,50 @@ class BestFacePipeline(DistilledPipeline):
             source_id=source_id,
             phase_scale=phase_scale,
             reference_crf=reference_crf,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            first_frame_strength=first_frame_strength,
+            last_frame_strength=last_frame_strength,
         )
-        return self._decode_and_save_video(
+        saved_path = self._decode_and_save_video(
             video_latent,
             audio_latent,
             output_path,
             frame_rate=frame_rate,
         )
+        effective_height, effective_width = snap_output_dimensions(height, width, two_stage=True)
+        _write_generation_metadata(
+            saved_path,
+            {
+                "created_at": datetime.now(UTC).isoformat(),
+                "pipeline": type(self).__name__,
+                "prompt": prompt,
+                "reference": str(Path(reference).expanduser().resolve()),
+                "reference_scale": reference_scale,
+                "resize_mode": resize_mode,
+                "reference_crf": reference_crf,
+                "first_frame": str(Path(first_frame).expanduser().resolve()) if first_frame else None,
+                "last_frame": str(Path(last_frame).expanduser().resolve()) if last_frame else None,
+                "first_frame_strength": first_frame_strength,
+                "last_frame_strength": last_frame_strength,
+                "height": effective_height,
+                "width": effective_width,
+                "num_frames": num_frames,
+                "frame_rate": frame_rate,
+                "seed": seed,
+                "stage1_steps": stage1_steps,
+                "stage2_steps": stage2_steps,
+                "source_id": source_id,
+                "phase_scale": phase_scale,
+                "model": str(self.model_dir),
+                "loras": [
+                    {"path": str(path), "strength": strength}
+                    for path, strength in self._pending_loras
+                ],
+                "output": str(Path(saved_path).expanduser().resolve()),
+            },
+        )
+        return saved_path
 
 
 def _default_best_face_spec(character_sheet: bool) -> str:
@@ -520,6 +658,18 @@ def main() -> None:
     )
     parser.add_argument("--seed", "-s", type=int, default=-1)
     parser.add_argument("--no-low-memory", action="store_true")
+    parser.add_argument(
+        "--first-frame",
+        default=None,
+        help="Optional image guiding the opening composition at pixel frame 0.",
+    )
+    parser.add_argument(
+        "--last-frame",
+        default=None,
+        help="Optional image guiding the final composition at the last pixel frame.",
+    )
+    parser.add_argument("--first-frame-strength", type=float, default=1.0)
+    parser.add_argument("--last-frame-strength", type=float, default=1.0)
 
     args = parser.parse_args()
     if args.seed < 0:
@@ -548,6 +698,10 @@ def main() -> None:
     print(f"  reference scale: {args.reference_scale:g}")
     print(f"  source phase: source_id={args.source_id:g}, scale={args.phase_scale:g}")
     print(f"  seed: {args.seed}")
+    if args.first_frame:
+        print(f"  first frame: {args.first_frame} (strength {args.first_frame_strength:g})")
+    if args.last_frame:
+        print(f"  last frame: {args.last_frame} (strength {args.last_frame_strength:g})")
 
     pipe.generate_and_save_best_face(
         prompt=args.prompt,
@@ -565,6 +719,10 @@ def main() -> None:
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,
+        first_frame=args.first_frame,
+        last_frame=args.last_frame,
+        first_frame_strength=args.first_frame_strength,
+        last_frame_strength=args.last_frame_strength,
     )
     print(f"Saved {Path(args.output)} in {time.time() - t0:.1f}s")
 
