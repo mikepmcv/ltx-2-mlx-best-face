@@ -70,6 +70,12 @@ class LTXModelConfig:
     positional_embedding_max_pos: tuple[int, ...] = (20, 2048, 2048)
     audio_positional_embedding_max_pos: tuple[int, ...] = (20,)
     norm_eps: float = 1e-6
+    # LTX-2.5 deltas. Defaults preserve pre-2.5 behavior: checkpoints without
+    # these config keys keep FF biases and have no keyframes embedding
+    # (matching upstream model_configurator.py:77-82).
+    ff_bias: bool = True
+    audio_ff_bias: bool = True
+    use_keyframes_abs_pos_embedding: bool = False
 
     @classmethod
     def from_checkpoint_config(cls, config: dict) -> LTXModelConfig:
@@ -117,6 +123,9 @@ class LTXModelConfig:
                 t.get("audio_positional_embedding_max_pos", d.audio_positional_embedding_max_pos)
             ),
             norm_eps=t.get("norm_eps", d.norm_eps),
+            ff_bias=t.get("ff_bias", d.ff_bias),
+            audio_ff_bias=t.get("audio_ff_bias", d.audio_ff_bias),
+            use_keyframes_abs_pos_embedding=t.get("use_keyframes_abs_pos_embedding", d.use_keyframes_abs_pos_embedding),
         )
 
     @classmethod
@@ -180,6 +189,14 @@ class LTXModel(nn.Module):
         self.patchify_proj = nn.Linear(config.video_patch_channels, vd)
         self.audio_patchify_proj = nn.Linear(config.audio_patch_channels, ad)
 
+        # --- Keyframes absolute position embedding (LTX-2.5, video only) ---
+        # (1, video_dim), zero-init upstream; added post-patchify to tokens the
+        # keyframes_mask marks (always the target's first latent frame, plus
+        # generated keyframe slots). Created only when the config enables it so
+        # pre-2.5 checkpoints load with no unused parameter.
+        if config.use_keyframes_abs_pos_embedding:
+            self.keyframes_abs_pos_embedding = mx.zeros((1, vd))
+
         # --- Output projections ---
         self.proj_out = nn.Linear(vd, config.video_patch_channels)
         self.audio_proj_out = nn.Linear(ad, config.audio_patch_channels)
@@ -215,6 +232,8 @@ class LTXModel(nn.Module):
                 av_cross_head_dim=config.av_cross_head_dim,
                 ff_mult=config.ff_mult,
                 norm_eps=config.norm_eps,
+                ff_bias=config.ff_bias,
+                audio_ff_bias=config.audio_ff_bias,
             )
             for _ in range(config.num_layers)
         ]
@@ -277,7 +296,7 @@ class LTXModel(nn.Module):
     def compute_gate_signal(
         self,
         video_latent: mx.array,
-        audio_latent: mx.array,
+        audio_latent: mx.array | None,
         timestep: mx.array,
         video_timesteps: mx.array | None = None,
     ) -> mx.array:
@@ -300,7 +319,15 @@ class LTXModel(nn.Module):
         """
         del audio_latent  # signature parity with __call__; not needed for gate
         video_latent = video_latent.astype(mx.bfloat16)
-        timestep = timestep.astype(mx.bfloat16)
+        # ⚠️ Keep the timestep in fp32 through the SINUSOIDAL embedding.
+        # Rounding sigma to bf16 first shifts the embedding argument by up to
+        # ~3.4 (sigma*1000), and the high-frequency components of a sinusoidal
+        # embedding have period ~1 — so those dimensions get scrambled.
+        # Upstream computes get_timestep_embedding on the fp32 timesteps and
+        # only then runs the MLP in the model dtype. (Measured: bf16 rounding
+        # here cost up to 0.86 velocity cosine mid-trajectory, on sigmas that
+        # are not exactly representable in bf16.)
+        timestep = timestep.astype(mx.float32)
 
         video_hidden = self.patchify_proj(video_latent)
         t_emb = self._embed_timestep_scalar(timestep)
@@ -327,6 +354,7 @@ class LTXModel(nn.Module):
         video_cross_attention_mask: mx.array | None = None,
         video_timesteps: mx.array | None = None,
         audio_timesteps: mx.array | None = None,
+        keyframes_mask: mx.array | None = None,
         perturbations: BatchedPerturbationConfig | None = None,
         tap: callable | None = None,
         block_stack_override: callable | None = None,
@@ -377,20 +405,49 @@ class LTXModel(nn.Module):
             Tuple of (video_velocity, audio_velocity), same shapes as inputs.
         """
         # Cast inputs to bfloat16 to match weight dtype and avoid mixed-precision
-        # accumulation errors over 48 transformer blocks
-        video_latent = video_latent.astype(mx.bfloat16)
-        audio_latent = audio_latent.astype(mx.bfloat16)
+        # accumulation errors over 48 transformer blocks.
+        # LTX2_DIT_FP32=1 keeps fp32 (parity-testing only — clean apples-to-apples
+        # vs an fp32 Swift port without bf16 rounding noise).
+        _dt = mx.float32 if _os.environ.get("LTX2_DIT_FP32") else mx.bfloat16
+        video_latent = video_latent.astype(_dt)
+        # ``audio_latent is None`` = the AUDIO-FREE forward (upstream ``audio=None``).
+        # Video still runs; it just loses its A2V cross-attention contribution, exactly as
+        # upstream's ``run_a2v`` gate does. Used by DFR temporal rounds, where upstream
+        # denoises each tile video-only.
+        run_ax = audio_latent is not None
+        audio_latent = audio_latent.astype(_dt) if run_ax else None
         if video_text_embeds is not None:
-            video_text_embeds = video_text_embeds.astype(mx.bfloat16)
+            video_text_embeds = video_text_embeds.astype(_dt)
         if audio_text_embeds is not None:
-            audio_text_embeds = audio_text_embeds.astype(mx.bfloat16)
+            audio_text_embeds = audio_text_embeds.astype(_dt)
 
         # Embed patches
         video_hidden = self.patchify_proj(video_latent)
-        audio_hidden = self.audio_patchify_proj(audio_latent)
+        audio_hidden = self.audio_patchify_proj(audio_latent) if run_ax else None
+
+        # --- Keyframes absolute position embedding (LTX-2.5) ---
+        # Applied immediately after patchify, before AdaLN / RoPE / blocks,
+        # to tokens the (B, Nv, 1) keyframes_mask marks (>0). Upstream:
+        # transformer_args.py apply_keyframes_absolute_embedding.
+        kf_emb = getattr(self, "keyframes_abs_pos_embedding", None)
+        if kf_emb is not None and keyframes_mask is not None:
+            kf = (keyframes_mask > 0).astype(video_hidden.dtype)
+            video_hidden = video_hidden + kf * kf_emb.astype(video_hidden.dtype)
 
         # --- Timestep embeddings ---
-        timestep = timestep.astype(mx.bfloat16)
+        # ⚠️ Keep the timestep in fp32 through the SINUSOIDAL embedding.
+        # ⚠️ Do NOT "simplify" this to the model dtype (`_dt`). Merging main into the 2.5 line
+        # conflicted exactly here, and taking main's side would have silently reintroduced the
+        # bf16-sigma bug this comment documents — the Swift port's `--timestep-dtype-gate` exists
+        # to pin the same behaviour.
+        # Rounding sigma to bf16 first shifts the embedding argument by up to
+        # ~3.4 (sigma*1000), and the high-frequency components of a sinusoidal
+        # embedding have period ~1 — so those dimensions get scrambled.
+        # Upstream computes get_timestep_embedding on the fp32 timesteps and
+        # only then runs the MLP in the model dtype. (Measured: bf16 rounding
+        # here cost up to 0.86 velocity cosine mid-trajectory, on sigmas that
+        # are not exactly representable in bf16.)
+        timestep = timestep.astype(mx.float32)
         t_emb = self._embed_timestep_scalar(timestep)
 
         # AV cross-attention gate uses a different timestep scale (default 1, not 1000).
@@ -440,7 +497,7 @@ class LTXModel(nn.Module):
                 self.config.video_num_heads,
                 self.config.video_head_dim,
             )
-        if audio_positions is not None:
+        if run_ax and audio_positions is not None:
             audio_rope_freqs = self._compute_rope_freqs(
                 audio_positions,
                 self.config.audio_num_heads,
@@ -464,7 +521,7 @@ class LTXModel(nn.Module):
                 self.config.av_cross_head_dim,
                 max_pos_override=[cross_pe_max_pos],
             )
-        if audio_positions is not None:
+        if run_ax and audio_positions is not None:
             audio_cross_rope_freqs = self._compute_rope_freqs(
                 audio_positions[:, :, 0:1],  # temporal dimension only
                 self.config.av_cross_num_heads,
@@ -477,6 +534,12 @@ class LTXModel(nn.Module):
         block_input_a = audio_hidden
 
         if block_stack_override is not None:
+            if not run_ax:
+                raise ValueError(
+                    "block_stack_override (TeaCache) is not supported on the audio-free forward: "
+                    "the skip path reconstructs output = input + cached_residual, and a None audio "
+                    "input would either raise or return the cached residual as a bogus velocity."
+                )
             video_hidden, audio_hidden = block_stack_override(video_hidden, audio_hidden)
         else:
             num_layers = self.config.num_layers if block_provider is not None else len(self.transformer_blocks)
@@ -557,12 +620,19 @@ class LTXModel(nn.Module):
                     _mx_eval(video_hidden, audio_hidden)
 
         if tap is not None:
-            tap(video_hidden - block_input_v, audio_hidden - block_input_a)
+            # audio_hidden/block_input_a are None on the audio-free forward; report the
+            # video residual and hand the consumer None rather than computing None - None.
+            tap(
+                video_hidden - block_input_v,
+                (audio_hidden - block_input_a) if run_ax else None,
+            )
 
         # Output: AdaLN with scale_shift_table + embedded_timestep + proj
         video_out = self._output_block(video_hidden, video_embedded_ts, self.scale_shift_table, self.proj_out)
-        audio_out = self._output_block(
-            audio_hidden, audio_embedded_ts, self.audio_scale_shift_table, self.audio_proj_out
+        audio_out = (
+            self._output_block(audio_hidden, audio_embedded_ts, self.audio_scale_shift_table, self.audio_proj_out)
+            if run_ax
+            else None
         )
 
         return video_out, audio_out
@@ -642,7 +712,7 @@ class X0Model(nn.Module):
     def __call__(
         self,
         video_latent: mx.array,
-        audio_latent: mx.array,
+        audio_latent: mx.array | None,
         sigma: mx.array,
         video_timesteps: mx.array | None = None,
         audio_timesteps: mx.array | None = None,
@@ -698,8 +768,12 @@ class X0Model(nn.Module):
         video_x0 = (video_latent.astype(mx.float32) - video_sigma * video_v.astype(mx.float32)).astype(
             video_latent.dtype
         )
-        audio_x0 = (audio_latent.astype(mx.float32) - audio_sigma * audio_v.astype(mx.float32)).astype(
-            audio_latent.dtype
+        # audio_v is None on the audio-free forward; propagate None rather than
+        # fabricating a zero tensor, so a caller that then uses it fails loudly.
+        audio_x0 = (
+            (audio_latent.astype(mx.float32) - audio_sigma * audio_v.astype(mx.float32)).astype(audio_latent.dtype)
+            if audio_v is not None
+            else None
         )
 
         return video_x0, audio_x0

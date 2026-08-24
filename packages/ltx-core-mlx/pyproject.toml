@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ltx-core-mlx"
 version = "0.14.22"
-description = "LTX-2.3 model library ported to MLX for Apple Silicon"
+description = "LTX-2.3/2.5 model library ported to MLX for Apple Silicon"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "dgrauet" }]
@@ -24,7 +24,7 @@ classifiers = [
 dependencies = [
     "mlx>=0.31.0",
     "mlx-arsenal>=0.2.4",
-    "mlx-lm>=0.31.0",
+    "mlx-lm>=0.31.2",
     "safetensors>=0.4.0",
     "huggingface-hub>=0.26.0",
     "numpy>=1.26.0",

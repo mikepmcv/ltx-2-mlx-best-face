@@ -2,39 +2,7 @@
 
 Mirrors upstream ``ltx_pipelines.utils.blocks`` (composition over
 inheritance). Each block owns the lifecycle of one model component
-(load, use, free) and exposes a small ``__call__`` API. Pipelines
-that prefer composition can instantiate these blocks directly:
-
-```python
-from ltx_pipelines_mlx import PromptEncoder, VideoDecoder, AudioDecoder
-
-prompt_enc = PromptEncoder(model_dir, gemma_model_id)
-video_emb, audio_emb = prompt_enc(prompt)  # loads, encodes, frees
-
-video_dec = VideoDecoder(model_dir)
-video_dec.decode_and_stream(video_latent, "out.mp4", audio_path="audio.wav")
-```
-
-The :class:`BasePipeline` inheritance tree (:class:`TI2VidTwoStagesPipeline`,
-:class:`RetakePipeline`, :class:`ICLoraPipeline`, ...) **delegates** to
-these blocks internally. Each pipeline holds private block instances
-(``self._prompt_encoder``, ``self._image_conditioner``,
-``self._video_decoder``, ``self._audio_decoder_block``); the historical
-attribute names (``self.text_encoder``, ``self.vae_encoder``, ...) are
-properties that proxy onto the block internals so subclass code that
-reads/writes them — including ``self.text_encoder = None`` to free
-memory — continues to work.
-
-The blocks are the single source of truth for loader logic; the
-inheritance API exists purely for backward compat with the current
-subclass bodies.
-
-Differences vs upstream:
-
-- No CPU/GPU offload context managers — MLX uses unified memory, so
-  blocks just hold strong refs and rely on Python GC + ``aggressive_cleanup``.
-- No ``Builder``/``Registry`` indirection — blocks load weights via
-  :func:`load_split_safetensors` directly, mirroring our existing path.
+(load, use, free) and exposes a small ``__call__`` API.
 """
 
 from __future__ import annotations
@@ -56,11 +24,10 @@ from ltx_core_mlx.text_encoders.gemma.feature_extractor import GemmaFeaturesExtr
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.weights import load_split_safetensors, remap_audio_vae_keys
 
-_materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags the literal mx.eval pattern
+_materialize = getattr(mx, "eval")  # noqa: B009
 
 
 def _resolve_model_dir(model_dir: str | Path) -> Path:
-    """Resolve a model dir — download from HuggingFace if not a local path."""
     path = Path(model_dir)
     if path.exists():
         return path
@@ -70,12 +37,7 @@ def _resolve_model_dir(model_dir: str | Path) -> Path:
 
 
 class PromptEncoder:
-    """Owns Gemma + connector lifecycle. Encodes prompts on call.
-
-    Mirrors upstream ``utils.blocks.PromptEncoder``. Loads Gemma + the
-    feature-extractor connector lazily on first call, encodes the prompt
-    into ``(video_embeds, audio_embeds)``, then frees both modules.
-    """
+    """Owns Gemma + connector lifecycle and selects Gemma 3/4 from the checkpoint."""
 
     def __init__(
         self,
@@ -88,10 +50,11 @@ class PromptEncoder:
         self._feature_extractor: GemmaFeaturesExtractorV2 | None = None
 
     def load(self) -> None:
-        """Load Gemma + connector if not already loaded."""
         if self._text_encoder is None:
-            self._text_encoder = GemmaLanguageModel()
-            self._text_encoder.load(self.gemma_model_id)
+            from ltx_core_mlx.text_encoders.gemma.encoders.gemma4_encoder import resolve_text_encoder
+
+            self._text_encoder = resolve_text_encoder(self.model_dir, self.gemma_model_id)
+            self._text_encoder.load()
             aggressive_cleanup()
 
         if self._feature_extractor is None:
@@ -101,27 +64,19 @@ class PromptEncoder:
             aggressive_cleanup()
 
     def free(self) -> None:
-        """Drop strong refs; rely on GC + aggressive_cleanup to reclaim memory."""
         self._text_encoder = None
         self._feature_extractor = None
         aggressive_cleanup()
 
     def encode(self, prompt: str) -> tuple[mx.array, mx.array]:
-        """Encode a single prompt to ``(video_embeds, audio_embeds)``.
-
-        Caller is responsible for freeing via :meth:`free` when done with
-        the encoder. For one-shot use, prefer :meth:`__call__`.
-        """
         import os
 
         self.load()
         assert self._text_encoder is not None
         assert self._feature_extractor is not None
-
         max_length = int(os.environ.get("LTX2_GEMMA_MAX_LENGTH", "1024"))
         all_hidden_states, attention_mask = self._text_encoder.encode_all_layers(prompt, max_length=max_length)
-        video_embeds, audio_embeds = self._feature_extractor(all_hidden_states, attention_mask=attention_mask)
-        return video_embeds, audio_embeds
+        return self._feature_extractor(all_hidden_states, attention_mask=attention_mask)
 
     def __call__(
         self,
@@ -129,17 +84,6 @@ class PromptEncoder:
         *,
         free_after: bool = True,
     ) -> tuple[mx.array, mx.array] | list[tuple[mx.array, mx.array]]:
-        """Encode one or more prompts; free Gemma + connector afterwards by default.
-
-        Args:
-            prompts: Single prompt or list of prompts. With a list, each
-                element is encoded sequentially and a list of tuples is
-                returned (matches upstream's batched signature).
-            free_after: If True (default), drop strong refs to Gemma and
-                the connector after encoding so subsequent components fit
-                in memory. Pass False to keep the encoder loaded for
-                subsequent calls.
-        """
         if isinstance(prompts, str):
             video, audio = self.encode(prompts)
             _materialize(video, audio)
@@ -158,18 +102,11 @@ class PromptEncoder:
 
 
 class ImageConditioner:
-    """Owns the video VAE encoder lifecycle.
-
-    Mirrors upstream ``utils.blocks.ImageConditioner``. Wraps a callable
-    so that the encoder is built, passed to user code, then freed.
-    """
-
     def __init__(self, model_dir: str | Path) -> None:
         self.model_dir = _resolve_model_dir(model_dir)
         self._encoder: _VideoVAEEncoder | None = None
 
     def load(self) -> _VideoVAEEncoder:
-        """Build the VAE encoder (cached)."""
         if self._encoder is not None:
             return self._encoder
         self._encoder = _VideoVAEEncoder()
@@ -187,7 +124,6 @@ class ImageConditioner:
         aggressive_cleanup()
 
     def __call__(self, fn: Callable[[_VideoVAEEncoder], object], *, free_after: bool = True) -> object:
-        """Build encoder, call ``fn(encoder)``, then free encoder."""
         encoder = self.load()
         result = fn(encoder)
         if free_after:
@@ -196,13 +132,6 @@ class ImageConditioner:
 
 
 class VideoDecoder:
-    """Owns the video VAE decoder lifecycle + ffmpeg streaming muxing.
-
-    Mirrors upstream ``utils.blocks.VideoDecoder`` (streaming decode +
-    audio mux). Use :meth:`decode_and_stream` to decode a latent and
-    mux with an audio file in one shot.
-    """
-
     def __init__(self, model_dir: str | Path, verbose: bool = True) -> None:
         self.model_dir = _resolve_model_dir(model_dir)
         self.verbose = verbose
@@ -228,7 +157,6 @@ class VideoDecoder:
         frame_rate: float = 24.0,
         audio_path: str | None = None,
     ) -> str:
-        """Stream-decode the latent into an mp4 with optional audio mux."""
         if self.verbose:
             tiling = _compute_decode_tiling(video_latent.shape, frame_rate=frame_rate)
             if tiling is not None and tiling.temporal_config is not None:
@@ -244,13 +172,6 @@ class VideoDecoder:
 
 
 class AudioDecoder:
-    """Owns the audio VAE decoder + vocoder + BWE lifecycle.
-
-    Mirrors upstream ``utils.blocks.AudioDecoder``. Decodes an audio
-    latent through ``AudioVAEDecoder`` → BigVGAN vocoder → BWE to a
-    waveform tensor at 48 kHz.
-    """
-
     def __init__(self, model_dir: str | Path) -> None:
         self.model_dir = _resolve_model_dir(model_dir)
         self._audio_decoder: AudioVAEDecoder | None = None
@@ -285,21 +206,12 @@ class AudioDecoder:
         aggressive_cleanup()
 
     def __call__(self, audio_latent: mx.array) -> mx.array:
-        """Decode audio latent into a 48 kHz stereo waveform."""
         decoder, vocoder = self.load()
         mel = decoder.decode(audio_latent)
         return vocoder(mel)
 
 
 class AudioConditioner:
-    """Owns the audio VAE encoder + processor lifecycle.
-
-    Mirrors upstream ``utils.blocks.AudioConditioner``. Used by
-    :class:`RetakePipeline` to encode the source audio of an existing
-    video before regenerating a time region. Wraps a callable so the
-    encoder + processor are built, passed to user code, then freed.
-    """
-
     def __init__(self, model_dir: str | Path) -> None:
         self.model_dir = _resolve_model_dir(model_dir)
         self._encoder: object | None = None
@@ -328,7 +240,6 @@ class AudioConditioner:
         aggressive_cleanup()
 
     def __call__(self, fn: Callable[[object, object], object], *, free_after: bool = True) -> object:
-        """Build encoder+processor, call ``fn(encoder, processor)``, free."""
         encoder, processor = self.load()
         result = fn(encoder, processor)
         if free_after:
@@ -337,12 +248,6 @@ class AudioConditioner:
 
 
 class VideoUpsampler:
-    """Owns the spatial upsampler lifecycle.
-
-    Mirrors upstream ``utils.blocks.VideoUpsampler``. Use for 2x spatial
-    upscale between stage 1 and stage 2 of the two-stage pipelines.
-    """
-
     def __init__(
         self,
         model_dir: str | Path,
@@ -355,18 +260,15 @@ class VideoUpsampler:
     def load(self) -> LatentUpsampler:
         if self._upsampler is not None:
             return self._upsampler
-
         import json
 
         config_path = self.model_dir / f"{self.name}_config.json"
         weights_path = self.model_dir / f"{self.name}.safetensors"
-
         if config_path.exists():
             config = json.loads(config_path.read_text()).get("config", {})
             self._upsampler = LatentUpsampler.from_config(config)
         else:
             self._upsampler = LatentUpsampler()
-
         if weights_path.exists():
             weights = load_split_safetensors(weights_path, prefix=f"{self.name}.")
             self._upsampler.load_weights(list(weights.items()))
@@ -378,9 +280,7 @@ class VideoUpsampler:
         aggressive_cleanup()
 
     def __call__(self, latent: mx.array) -> mx.array:
-        """Upscale a denormalized latent (caller must denorm/renorm)."""
-        upsampler = self.load()
-        return upsampler(latent)
+        return self.load()(latent)
 
 
 __all__ = [
