@@ -13,6 +13,8 @@ from ltx_pipelines_mlx.best_face import (
     BestFacePipeline,
     _metadata_path,
     _prepare_keyframe_image,
+    _resolve_generation_settings,
+    _sigma_schedule_for_steps,
     _write_generation_metadata,
 )
 from ltx_pipelines_mlx.best_face_exact import (
@@ -69,6 +71,61 @@ def test_reference_scale_rejects_invalid_values(tmp_path: Path, scale: float):
             target_w=768,
             reference_scale=scale,
         )
+
+
+def test_generation_settings_preserve_existing_defaults():
+    assert _resolve_generation_settings(
+        stage1_steps=None,
+        stage2_steps=None,
+        reference_scale=1.0,
+        stage1_reference_scale=None,
+        stage2_reference_scale=None,
+        fast_refine=False,
+        ugc_fast=False,
+    ) == (None, None, 1.0, 1.0, False)
+
+
+def test_ugc_fast_resolves_speed_preset():
+    assert _resolve_generation_settings(
+        stage1_steps=None,
+        stage2_steps=None,
+        reference_scale=1.0,
+        stage1_reference_scale=None,
+        stage2_reference_scale=None,
+        fast_refine=False,
+        ugc_fast=True,
+    ) == (6, 2, 0.5, 1.0, True)
+
+
+def test_ugc_fast_allows_explicit_stage_and_scale_overrides():
+    assert _resolve_generation_settings(
+        stage1_steps=7,
+        stage2_steps=3,
+        reference_scale=0.75,
+        stage1_reference_scale=0.625,
+        stage2_reference_scale=0.875,
+        fast_refine=False,
+        ugc_fast=True,
+    ) == (7, 3, 0.625, 0.875, True)
+
+
+def test_reduced_sigma_schedule_keeps_terminal_zero_and_detail_steps():
+    schedule = [1.0, 0.99, 0.98, 0.9, 0.7, 0.4, 0.0]
+
+    assert _sigma_schedule_for_steps(schedule, 4) == [1.0, 0.9, 0.7, 0.4, 0.0]
+
+
+def test_full_sigma_schedule_is_unchanged():
+    schedule = [1.0, 0.7, 0.0]
+
+    assert _sigma_schedule_for_steps(schedule, None) is schedule
+    assert _sigma_schedule_for_steps(schedule, 2) is schedule
+
+
+@pytest.mark.parametrize("steps", [0, 9])
+def test_sigma_schedule_rejects_invalid_step_count(steps: int):
+    with pytest.raises(ValueError, match="steps must be between"):
+        _sigma_schedule_for_steps([1.0, 0.7, 0.0], steps)
 
 
 def test_keyframe_specs_use_first_and_last_pixel_frames():

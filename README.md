@@ -45,6 +45,9 @@ uv sync --all-extras
 
 ## Quick Start
 
+For character-sheet identity conditioning, including the parity and opt-in
+UGC-fast workflows, see [Best Face ID on MLX](docs/BEST_FACE.md).
+
 ### CLI
 
 ```bash

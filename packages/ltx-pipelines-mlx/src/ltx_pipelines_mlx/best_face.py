@@ -53,6 +53,58 @@ BEST_FACE_FILE = "Best_FaceID_v1.0_LoRA.safetensors"
 BEST_FACE_CHARACTER_SHEET_FILE = "Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors"
 OFFICIAL_BASE_FACE_STRENGTH = 0.2
 OFFICIAL_SPATIAL_UPSCALER_FILE = "spatial_upscaler_x2_v1_1.safetensors"
+UGC_FAST_STAGE1_STEPS = 6
+UGC_FAST_STAGE2_STEPS = 2
+UGC_FAST_STAGE1_REFERENCE_SCALE = 0.5
+UGC_FAST_STAGE2_REFERENCE_SCALE = 1.0
+
+
+def _sigma_schedule_for_steps(sigmas: list[float], steps: int | None) -> list[float]:
+    """Reduce a published schedule while preserving its terminal zero."""
+    available_steps = len(sigmas) - 1
+    if steps is None or steps == available_steps:
+        return sigmas
+    if not 1 <= steps <= available_steps:
+        raise ValueError(f"steps must be between 1 and {available_steps}")
+    # The distilled table spends several early steps close to sigma=1. Keep
+    # the initial sigma and the final `steps` values so reduced schedules retain
+    # the more consequential low-noise detail passes and always finish at zero.
+    return [sigmas[0], *sigmas[-steps:]]
+
+
+def _resolve_generation_settings(
+    *,
+    stage1_steps: int | None,
+    stage2_steps: int | None,
+    reference_scale: float,
+    stage1_reference_scale: float | None,
+    stage2_reference_scale: float | None,
+    fast_refine: bool,
+    ugc_fast: bool,
+) -> tuple[int | None, int | None, float, float, bool]:
+    """Resolve opt-in speed settings without changing parity defaults."""
+    if ugc_fast:
+        if stage1_steps is None:
+            stage1_steps = UGC_FAST_STAGE1_STEPS
+        if stage2_steps is None:
+            stage2_steps = UGC_FAST_STAGE2_STEPS
+        if stage1_reference_scale is None:
+            stage1_reference_scale = UGC_FAST_STAGE1_REFERENCE_SCALE
+        if stage2_reference_scale is None:
+            stage2_reference_scale = UGC_FAST_STAGE2_REFERENCE_SCALE
+        fast_refine = True
+
+    if stage1_reference_scale is None:
+        stage1_reference_scale = reference_scale
+    if stage2_reference_scale is None:
+        stage2_reference_scale = reference_scale
+    return (
+        stage1_steps,
+        stage2_steps,
+        stage1_reference_scale,
+        stage2_reference_scale,
+        fast_refine,
+    )
 
 
 def _resolve_adapter_spec(spec: str) -> str:
@@ -363,6 +415,10 @@ class BestFacePipeline(DistilledPipeline):
         stage2_steps: int | None = None,
         resize_mode: str = "match_target",
         reference_scale: float = 1.0,
+        stage1_reference_scale: float | None = None,
+        stage2_reference_scale: float | None = None,
+        fast_refine: bool = False,
+        ugc_fast: bool = False,
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
@@ -378,13 +434,29 @@ class BestFacePipeline(DistilledPipeline):
         if not prompt.lstrip().startswith("ref_t2v:"):
             prompt = "ref_t2v: " + prompt.strip()
 
+        (
+            stage1_steps,
+            stage2_steps,
+            stage1_reference_scale,
+            stage2_reference_scale,
+            fast_refine,
+        ) = _resolve_generation_settings(
+            stage1_steps=stage1_steps,
+            stage2_steps=stage2_steps,
+            reference_scale=reference_scale,
+            stage1_reference_scale=stage1_reference_scale,
+            stage2_reference_scale=stage2_reference_scale,
+            fast_refine=fast_refine,
+            ugc_fast=ugc_fast,
+        )
+
         # The official character-sheet refine pass uses CFG++ at CFG 1. Its
         # unconditional prediction still controls the sampler direction.
         self._load_text_encoder()
         with phase("Encoding prompt", verbose=self.verbose):
             video_embeds, audio_embeds = self._encode_text(prompt)
             _materialize(video_embeds, audio_embeds)
-            if getattr(self, "_best_face_cfg_pp", False):
+            if getattr(self, "_best_face_cfg_pp", False) and not fast_refine:
                 negative_prompt = getattr(self, "_best_face_negative_prompt", "")
                 neg_video_embeds, neg_audio_embeds = self._encode_text(negative_prompt)
                 _materialize(neg_video_embeds, neg_audio_embeds)
@@ -426,7 +498,7 @@ class BestFacePipeline(DistilledPipeline):
             resize_mode=resize_mode,
             target_h=H_half * 32,
             target_w=W_half * 32,
-            reference_scale=reference_scale,
+            reference_scale=stage1_reference_scale,
             frame_rate=frame_rate,
             num_generation_tokens=generation_tokens_1,
             source_id=source_id,
@@ -474,7 +546,7 @@ class BestFacePipeline(DistilledPipeline):
             legacy_scalar_blend=True,
         )
 
-        sigmas_1 = DISTILLED_SIGMAS[: stage1_steps + 1] if stage1_steps else DISTILLED_SIGMAS
+        sigmas_1 = _sigma_schedule_for_steps(DISTILLED_SIGMAS, stage1_steps)
         x0_model = X0Model(self.dit)
 
         install_source_phase(self.dit, [phase_1], theta=float(self.dit.config.rope_theta))
@@ -517,7 +589,7 @@ class BestFacePipeline(DistilledPipeline):
             resize_mode=resize_mode,
             target_h=H_full * 32,
             target_w=W_full * 32,
-            reference_scale=reference_scale,
+            reference_scale=stage2_reference_scale,
             frame_rate=frame_rate,
             num_generation_tokens=generation_tokens_2,
             source_id=source_id,
@@ -552,7 +624,7 @@ class BestFacePipeline(DistilledPipeline):
 
         video_tokens, _ = self.video_patchifier.patchify(video_upscaled)
         stage2_schedule = getattr(self, "_best_face_stage2_sigmas", STAGE_2_SIGMAS)
-        sigmas_2 = stage2_schedule[: stage2_steps + 1] if stage2_steps else stage2_schedule
+        sigmas_2 = _sigma_schedule_for_steps(stage2_schedule, stage2_steps)
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)
@@ -590,7 +662,7 @@ class BestFacePipeline(DistilledPipeline):
                 sigmas=sigmas_2,
                 on_step=self._stepwise_hook(F, H_full, W_full, stage=2),
             )
-            if getattr(self, "_best_face_cfg_pp", False):
+            if getattr(self, "_best_face_cfg_pp", False) and not fast_refine:
                 assert neg_video_embeds is not None and neg_audio_embeds is not None
                 output_2 = euler_ancestral_cfg_pp_denoise_loop(
                     **stage2_kwargs,
@@ -626,6 +698,10 @@ class BestFacePipeline(DistilledPipeline):
         stage2_steps: int | None = None,
         resize_mode: str = "match_target",
         reference_scale: float = 1.0,
+        stage1_reference_scale: float | None = None,
+        stage2_reference_scale: float | None = None,
+        fast_refine: bool = False,
+        ugc_fast: bool = False,
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
@@ -649,6 +725,10 @@ class BestFacePipeline(DistilledPipeline):
             stage2_steps=stage2_steps,
             resize_mode=resize_mode,
             reference_scale=reference_scale,
+            stage1_reference_scale=stage1_reference_scale,
+            stage2_reference_scale=stage2_reference_scale,
+            fast_refine=fast_refine,
+            ugc_fast=ugc_fast,
             source_id=source_id,
             phase_scale=phase_scale,
             reference_crf=reference_crf,
@@ -667,6 +747,21 @@ class BestFacePipeline(DistilledPipeline):
             frame_rate=frame_rate,
         )
         effective_height, effective_width = snap_output_dimensions(height, width, two_stage=True)
+        (
+            effective_stage1_steps,
+            effective_stage2_steps,
+            effective_stage1_reference_scale,
+            effective_stage2_reference_scale,
+            effective_fast_refine,
+        ) = _resolve_generation_settings(
+            stage1_steps=stage1_steps,
+            stage2_steps=stage2_steps,
+            reference_scale=reference_scale,
+            stage1_reference_scale=stage1_reference_scale,
+            stage2_reference_scale=stage2_reference_scale,
+            fast_refine=fast_refine,
+            ugc_fast=ugc_fast,
+        )
         _write_generation_metadata(
             saved_path,
             {
@@ -675,6 +770,10 @@ class BestFacePipeline(DistilledPipeline):
                 "prompt": prompt,
                 "reference": str(Path(reference).expanduser().resolve()),
                 "reference_scale": reference_scale,
+                "stage1_reference_scale": effective_stage1_reference_scale,
+                "stage2_reference_scale": effective_stage2_reference_scale,
+                "fast_refine": effective_fast_refine,
+                "ugc_fast": ugc_fast,
                 "resize_mode": resize_mode,
                 "reference_crf": reference_crf,
                 "first_frame": str(Path(first_frame).expanduser().resolve()) if first_frame else None,
@@ -689,8 +788,8 @@ class BestFacePipeline(DistilledPipeline):
                 "num_frames": num_frames,
                 "frame_rate": frame_rate,
                 "seed": seed,
-                "stage1_steps": stage1_steps,
-                "stage2_steps": stage2_steps,
+                "stage1_steps": effective_stage1_steps,
+                "stage2_steps": effective_stage2_steps,
                 "source_id": source_id,
                 "phase_scale": phase_scale,
                 "model": str(self.model_dir),
@@ -763,6 +862,32 @@ def main() -> None:
         default=1.0,
         help="Downscale the reference before VAE encoding while preserving its H/W position span.",
     )
+    parser.add_argument(
+        "--stage1-reference-scale",
+        type=float,
+        default=None,
+        help="Override reference scale for half-resolution Stage 1 only.",
+    )
+    parser.add_argument(
+        "--stage2-reference-scale",
+        type=float,
+        default=None,
+        help="Override reference scale for full-resolution Stage 2 only.",
+    )
+    parser.add_argument(
+        "--fast-refine",
+        action="store_true",
+        help="Use a single conditioned Stage 2 pass instead of two-pass CFG++.",
+    )
+    parser.add_argument(
+        "--ugc-fast",
+        action="store_true",
+        help=(
+            "Opt-in UGC speed preset: 6+2 steps, Stage 1 reference scale 0.5, "
+            "Stage 2 reference scale 1.0, and single-pass refinement. Explicit "
+            "stage/scale flags override preset values."
+        ),
+    )
     parser.add_argument("--height", "-H", type=int, default=576)
     parser.add_argument("--width", "-W", type=int, default=768)
     parser.add_argument("--frames", "-f", type=int, default=49)
@@ -818,6 +943,15 @@ def main() -> None:
     resize_mode = args.resize_mode or (
         "native_resolution" if args.character_sheet else "match_target"
     )
+    effective_settings = _resolve_generation_settings(
+        stage1_steps=args.stage1_steps,
+        stage2_steps=args.stage2_steps,
+        reference_scale=args.reference_scale,
+        stage1_reference_scale=args.stage1_reference_scale,
+        stage2_reference_scale=args.stage2_reference_scale,
+        fast_refine=args.fast_refine,
+        ugc_fast=args.ugc_fast,
+    )
     extra_loras = [(path, float(strength)) for path, strength in args.extra_lora]
 
     pipe = BestFacePipeline(
@@ -838,6 +972,12 @@ def main() -> None:
     print(f"  reference: {args.reference}")
     print(f"  resize mode: {resize_mode}")
     print(f"  reference scale: {args.reference_scale:g}")
+    print(
+        "  stages: "
+        f"{effective_settings[0] or 8}+{effective_settings[1] or 3}, "
+        f"reference scales {effective_settings[2]:g}/{effective_settings[3]:g}, "
+        f"{'single-pass' if effective_settings[4] else 'standard'} refine"
+    )
     if base_face_lora:
         print(f"  base Face-ID LoRA: {base_face_lora} (strength {args.base_face_strength:g})")
     print(f"  character Face-ID LoRA: {lora_spec} (strength {args.best_face_strength:g})")
@@ -862,6 +1002,10 @@ def main() -> None:
         stage2_steps=args.stage2_steps,
         resize_mode=resize_mode,
         reference_scale=args.reference_scale,
+        stage1_reference_scale=args.stage1_reference_scale,
+        stage2_reference_scale=args.stage2_reference_scale,
+        fast_refine=args.fast_refine,
+        ugc_fast=args.ugc_fast,
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,

@@ -30,6 +30,7 @@ from .best_face import (
     BestFacePipeline,
     _default_best_face_spec,
     _resolve_adapter_spec,
+    _resolve_generation_settings,
 )
 
 OFFICIAL_DISTILLED_LORA_STRENGTH = 0.6
@@ -166,6 +167,32 @@ def main() -> None:
         default=1.0,
         help="Downscale the reference before VAE encoding while preserving its H/W position span.",
     )
+    parser.add_argument(
+        "--stage1-reference-scale",
+        type=float,
+        default=None,
+        help="Override reference scale for half-resolution Stage 1 only.",
+    )
+    parser.add_argument(
+        "--stage2-reference-scale",
+        type=float,
+        default=None,
+        help="Override reference scale for full-resolution Stage 2 only.",
+    )
+    parser.add_argument(
+        "--fast-refine",
+        action="store_true",
+        help="Use single-pass Stage 2 refinement instead of official two-pass CFG++.",
+    )
+    parser.add_argument(
+        "--ugc-fast",
+        action="store_true",
+        help=(
+            "Opt-in UGC speed preset: 6+2 steps, Stage 1 reference scale 0.5, "
+            "Stage 2 reference scale 1.0, and single-pass refinement. Explicit "
+            "stage/scale flags override preset values."
+        ),
+    )
     parser.add_argument("--height", "-H", type=int, default=576)
     parser.add_argument("--width", "-W", type=int, default=768)
     parser.add_argument("--frames", "-f", type=int, default=49)
@@ -216,6 +243,15 @@ def main() -> None:
     resize_mode = args.resize_mode or (
         "native_resolution" if args.character_sheet else "match_target"
     )
+    effective_settings = _resolve_generation_settings(
+        stage1_steps=args.stage1_steps,
+        stage2_steps=args.stage2_steps,
+        reference_scale=args.reference_scale,
+        stage1_reference_scale=args.stage1_reference_scale,
+        stage2_reference_scale=args.stage2_reference_scale,
+        fast_refine=args.fast_refine,
+        ugc_fast=args.ugc_fast,
+    )
     extra_loras = [(path, float(strength)) for path, strength in args.extra_lora]
 
     pipe = BestFaceExactPipeline(
@@ -238,6 +274,12 @@ def main() -> None:
     print(f"  reference: {args.reference}")
     print(f"  resize mode: {resize_mode}")
     print(f"  reference scale: {args.reference_scale:g}")
+    print(
+        "  stages: "
+        f"{effective_settings[0] or 8}+{effective_settings[1] or 3}, "
+        f"reference scales {effective_settings[2]:g}/{effective_settings[3]:g}, "
+        f"{'single-pass' if effective_settings[4] else 'CFG++'} refine"
+    )
     if base_face_lora:
         print(f"  base Face-ID LoRA: {base_face_lora} (strength {args.base_face_strength:g})")
     print(f"  character Face-ID LoRA: {best_face_lora} (strength {args.best_face_strength:g})")
@@ -262,6 +304,10 @@ def main() -> None:
         stage2_steps=args.stage2_steps,
         resize_mode=resize_mode,
         reference_scale=args.reference_scale,
+        stage1_reference_scale=args.stage1_reference_scale,
+        stage2_reference_scale=args.stage2_reference_scale,
+        fast_refine=args.fast_refine,
+        ugc_fast=args.ugc_fast,
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,
