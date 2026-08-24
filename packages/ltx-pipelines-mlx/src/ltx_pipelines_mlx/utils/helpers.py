@@ -170,7 +170,31 @@ def create_noised_state(
             positions=state.positions,
             attention_mask=state.attention_mask,
         )
-        return state_with_conditionings(state, conditionings, spatial_dims)
+        base_token_count = state.latent.shape[1]
+        state = state_with_conditionings(state, conditionings, spatial_dims)
+
+        # Appended partial-strength conditionings still need mask-aware noise.
+        # Previously they were appended *after* the base region was noised and
+        # therefore always entered the first denoise step fully clean, even at
+        # strength=0.  Strength-1 references are unchanged because their mask
+        # is zero.  Keep the legacy scalar arithmetic for the base generation
+        # region while applying canonical GaussianNoiser semantics only to the
+        # newly appended tokens.
+        if state.latent.shape[1] > base_token_count:
+            appended_clean = state.clean_latent[:, base_token_count:, :]
+            appended_mask = state.denoise_mask[:, base_token_count:, :]
+            mx.random.seed(seed + 1)
+            appended_noise = mx.random.normal(appended_clean.shape).astype(appended_clean.dtype)
+            scaled_mask = appended_mask * sigma
+            appended_latent = appended_noise * scaled_mask + appended_clean * (1.0 - scaled_mask)
+            state = LatentState(
+                latent=mx.concatenate([state.latent[:, :base_token_count, :], appended_latent], axis=1),
+                clean_latent=state.clean_latent,
+                denoise_mask=state.denoise_mask,
+                positions=state.positions,
+                attention_mask=state.attention_mask,
+            )
+        return state
 
     state = state_with_conditionings(state, conditionings, spatial_dims)
     return noise_latent_state(state, sigma=sigma, seed=seed)

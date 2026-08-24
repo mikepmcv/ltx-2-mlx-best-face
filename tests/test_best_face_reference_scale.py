@@ -1,13 +1,16 @@
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 from PIL import Image
 
+from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
 from ltx_pipelines_mlx.best_face import (
     BestFacePipeline,
     _metadata_path,
     _write_generation_metadata,
 )
+from ltx_pipelines_mlx.utils.helpers import create_noised_state
 
 
 def test_reference_scale_halves_vae_size_and_preserves_position_span(tmp_path: Path):
@@ -91,3 +94,48 @@ def test_generation_metadata_is_written_beside_output(tmp_path: Path):
     assert metadata_path == _metadata_path(str(output))
     assert metadata_path.name == "clip.mp4.json"
     assert metadata_path.read_text(encoding="utf-8") == '{\n  "prompt": "test",\n  "seed": 123\n}\n'
+
+
+def test_legacy_noise_respects_partial_strength_on_appended_keyframe():
+    keyframe = VideoConditionByKeyframeIndex(
+        frame_idx=0,
+        keyframe_latent=mx.ones((1, 1, 2)),
+        spatial_dims=(1, 1, 1),
+        frame_rate=24.0,
+        strength=0.0,
+    )
+
+    state = create_noised_state(
+        base_shape=(1, 1, 2),
+        conditionings=[keyframe],
+        spatial_dims=(1, 1, 1),
+        positions=mx.zeros((1, 1, 3)),
+        seed=7,
+        sigma=1.0,
+        legacy_scalar_blend=True,
+    )
+
+    assert mx.array_equal(state.clean_latent[:, 1:, :], mx.ones((1, 1, 2))).item()
+    assert not mx.array_equal(state.latent[:, 1:, :], state.clean_latent[:, 1:, :]).item()
+
+
+def test_legacy_noise_preserves_full_strength_appended_reference():
+    keyframe = VideoConditionByKeyframeIndex(
+        frame_idx=0,
+        keyframe_latent=mx.ones((1, 1, 2)),
+        spatial_dims=(1, 1, 1),
+        frame_rate=24.0,
+        strength=1.0,
+    )
+
+    state = create_noised_state(
+        base_shape=(1, 1, 2),
+        conditionings=[keyframe],
+        spatial_dims=(1, 1, 1),
+        positions=mx.zeros((1, 1, 3)),
+        seed=7,
+        sigma=1.0,
+        legacy_scalar_blend=True,
+    )
+
+    assert mx.array_equal(state.latent[:, 1:, :], state.clean_latent[:, 1:, :]).item()
