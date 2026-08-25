@@ -242,24 +242,31 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         """
         import json
 
-        # Try new v1.1+ naming, then old naming
-        weights_path = self.model_dir / "spatial_upscaler_x2_v1_1.safetensors"
-        for stem in ["ltx-2.3-spatial-upscaler-x2", "spatial_upscaler_x2_v1_1"]:
-            resolved = self._resolve_safetensors(self.model_dir, stem)
-            if resolved.exists():
-                weights_path = resolved
-                break
+        requested = getattr(self, "_spatial_upscaler_path", None)
+        if requested:
+            weights_path = Path(requested).expanduser()
+            if not weights_path.is_absolute():
+                weights_path = self.model_dir / weights_path
+        else:
+            # Try new v1.1+ naming, then old naming.
+            weights_path = self.model_dir / "spatial_upscaler_x2_v1_1.safetensors"
+            for stem in ["ltx-2.3-spatial-upscaler-x2", "spatial_upscaler_x2_v1_1"]:
+                resolved = self._resolve_safetensors(self.model_dir, stem)
+                if resolved.exists():
+                    weights_path = resolved
+                    break
 
         if not weights_path.exists():
             raise FileNotFoundError(
-                f"Spatial upsampler weights not found in {self.model_dir} "
+                f"Spatial upsampler weights not found: {weights_path} "
                 "(looked for spatial_upscaler_x2_v1_1.safetensors and "
                 "ltx-2.3-spatial-upscaler-x2*.safetensors). The two-stage and "
                 "distilled pipelines require it for stage-2 upscaling; without "
                 "it the latent is upscaled by an untrained module and the "
                 "output degrades into a periodic 'mosaic' grid. Download it, "
                 "e.g.: hf download dgrauet/ltx-2.3-mlx-q8 "
-                f"spatial_upscaler_x2_v1_1.safetensors --local-dir {self.model_dir}"
+                f"spatial_upscaler_x2_v1_1.safetensors --local-dir {self.model_dir}. "
+                "An explicit file can be selected with --spatial-upscaler."
             )
 
         config_path = self.model_dir / f"{weights_path.stem}_config.json"

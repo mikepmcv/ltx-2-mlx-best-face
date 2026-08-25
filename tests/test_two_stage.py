@@ -302,6 +302,19 @@ class TestUpsamplerMissingWeights:
         # And no untrained upsampler may be left behind for stage 2 to use.
         assert pipe.upsampler is None
 
+    def test_explicit_upscaler_path_is_pinned(self, tmp_path):
+        from ltx_pipelines_mlx.ti2vid_two_stages import TI2VidTwoStagesPipeline
+
+        model_dir = tmp_path / "fake_model"
+        model_dir.mkdir()
+        pipe = TI2VidTwoStagesPipeline(model_dir=str(model_dir), low_memory=True)
+        pipe._spatial_upscaler_path = "chosen-upscaler.safetensors"
+
+        with pytest.raises(FileNotFoundError) as exc:
+            pipe._load_upsampler()
+
+        assert str(model_dir / "chosen-upscaler.safetensors") in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # Stage 2 dims from upscaled shape

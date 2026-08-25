@@ -4,12 +4,14 @@ import math
 
 import mlx.core as mx
 
+from ltx_core_mlx.conditioning.types.latent_cond import LatentState
 from ltx_pipelines_mlx.utils.samplers import (
     _compute_per_token_timesteps,
     _is_uniform_mask,
     _res2s_coefficients,
     _res2s_phi,
     _res2s_sde_coeff,
+    euler_ancestral_cfg_pp_denoise_loop,
     euler_step,
 )
 
@@ -261,3 +263,48 @@ class TestRes2sSdeCoeff:
         """sigma_up_fraction=0 should give sigma_up=0."""
         alpha, sigma_down, sigma_up = _res2s_sde_coeff(sigma_next=0.5, sigma_up_fraction=0.0)
         assert sigma_up == 0.0
+
+
+class TestEulerAncestralCfgPpLoop:
+    def test_runs_cond_and_uncond_and_preserves_reference_tokens(self):
+        class FakeModel:
+            def __init__(self):
+                self.contexts = []
+
+            def __call__(self, **kwargs):
+                context = kwargs["video_text_embeds"]
+                self.contexts.append(float(context.reshape(-1)[0].item()))
+                value = context.reshape(-1)[0]
+                return (
+                    mx.full(kwargs["video_latent"].shape, value),
+                    mx.full(kwargs["audio_latent"].shape, value),
+                )
+
+        video_clean = mx.array([[[0.0], [7.0]]])
+        video_state = LatentState(
+            latent=mx.array([[[1.0], [7.0]]]),
+            clean_latent=video_clean,
+            denoise_mask=mx.array([[[1.0], [0.0]]]),
+        )
+        audio_state = LatentState(
+            latent=mx.array([[[1.0]]]),
+            clean_latent=mx.zeros((1, 1, 1)),
+            denoise_mask=mx.ones((1, 1, 1)),
+        )
+        model = FakeModel()
+        mx.random.seed(123)
+
+        output = euler_ancestral_cfg_pp_denoise_loop(
+            model=model,
+            video_state=video_state,
+            audio_state=audio_state,
+            video_text_embeds=mx.array([[[0.25]]]),
+            audio_text_embeds=mx.array([[[0.25]]]),
+            negative_video_text_embeds=mx.array([[[-0.25]]]),
+            negative_audio_text_embeds=mx.array([[[-0.25]]]),
+            sigmas=[0.85, 0.4, 0.0],
+            show_progress=False,
+        )
+
+        assert model.contexts == [0.25, -0.25, 0.25, -0.25]
+        assert float(output.video_latent[0, 1, 0].item()) == 7.0
