@@ -82,6 +82,7 @@ def test_generation_settings_preserve_existing_defaults():
         stage2_reference_scale=None,
         fast_refine=False,
         ugc_fast=False,
+        ugc_ultrafast=False,
     ) == (None, None, 1.0, 1.0, False)
 
 
@@ -94,6 +95,20 @@ def test_ugc_fast_resolves_speed_preset():
         stage2_reference_scale=None,
         fast_refine=False,
         ugc_fast=True,
+        ugc_ultrafast=False,
+    ) == (6, 2, 1.0, 1.0, True)
+
+
+def test_ugc_ultrafast_resolves_maximum_speed_preset():
+    assert _resolve_generation_settings(
+        stage1_steps=None,
+        stage2_steps=None,
+        reference_scale=1.0,
+        stage1_reference_scale=None,
+        stage2_reference_scale=None,
+        fast_refine=False,
+        ugc_fast=False,
+        ugc_ultrafast=True,
     ) == (6, 2, 0.5, 1.0, True)
 
 
@@ -106,7 +121,22 @@ def test_ugc_fast_allows_explicit_stage_and_scale_overrides():
         stage2_reference_scale=0.875,
         fast_refine=False,
         ugc_fast=True,
+        ugc_ultrafast=False,
     ) == (7, 3, 0.625, 0.875, True)
+
+
+def test_ugc_presets_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _resolve_generation_settings(
+            stage1_steps=None,
+            stage2_steps=None,
+            reference_scale=1.0,
+            stage1_reference_scale=None,
+            stage2_reference_scale=None,
+            fast_refine=False,
+            ugc_fast=True,
+            ugc_ultrafast=True,
+        )
 
 
 def test_reduced_sigma_schedule_keeps_terminal_zero_and_detail_steps():

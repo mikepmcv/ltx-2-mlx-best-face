@@ -184,13 +184,21 @@ def main() -> None:
         action="store_true",
         help="Use single-pass Stage 2 refinement instead of official two-pass CFG++.",
     )
-    parser.add_argument(
+    speed_presets = parser.add_mutually_exclusive_group()
+    speed_presets.add_argument(
         "--ugc-fast",
         action="store_true",
         help=(
-            "Opt-in UGC speed preset: 6+2 steps, Stage 1 reference scale 0.5, "
-            "Stage 2 reference scale 1.0, and single-pass refinement. Explicit "
-            "stage/scale flags override preset values."
+            "Balanced UGC preset: 6+2 steps, native references in both stages, "
+            "and single-pass refinement. Explicit stage/scale flags override it."
+        ),
+    )
+    speed_presets.add_argument(
+        "--ugc-ultrafast",
+        action="store_true",
+        help=(
+            "Maximum-speed UGC preset: same as --ugc-fast but Stage 1 uses a "
+            "0.5 reference scale, trading more identity fidelity for speed."
         ),
     )
     parser.add_argument("--height", "-H", type=int, default=576)
@@ -251,6 +259,7 @@ def main() -> None:
         stage2_reference_scale=args.stage2_reference_scale,
         fast_refine=args.fast_refine,
         ugc_fast=args.ugc_fast,
+        ugc_ultrafast=args.ugc_ultrafast,
     )
     extra_loras = [(path, float(strength)) for path, strength in args.extra_lora]
 
@@ -308,6 +317,7 @@ def main() -> None:
         stage2_reference_scale=args.stage2_reference_scale,
         fast_refine=args.fast_refine,
         ugc_fast=args.ugc_fast,
+        ugc_ultrafast=args.ugc_ultrafast,
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,

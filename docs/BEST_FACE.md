@@ -20,8 +20,8 @@ uv run python -m ltx_pipelines_mlx.best_face_exact \
 
 ## Opt-in UGC fast workflow
 
-Add `--ugc-fast` to target close and waist-up UGC shots where reduced runtime
-is more important than exact sampler parity:
+Add `--ugc-fast` for the tested balance of identity, quality, and speed on
+close and waist-up UGC shots:
 
 ```bash
 uv run python -m ltx_pipelines_mlx.best_face_exact \
@@ -39,22 +39,35 @@ The preset applies:
 
 - 6 Stage 1 steps instead of 8;
 - 2 Stage 2 steps instead of 3;
-- `0.5` reference scale in half-resolution Stage 1;
-- native `1.0` reference scale in full-resolution Stage 2;
+- native `1.0` reference scale in both stages;
 - single conditioned Stage 2 refinement instead of two-pass CFG++.
 
-It is deliberately opt-in. Benchmark it against the quality workflow with the
-same prompt, seed, reference, dimensions, and frame count before choosing it
-for production. The intended target is roughly half the generation time while
-retaining most perceived quality; actual speed and quality depend on framing,
-clip length, and hardware.
+It is deliberately opt-in. In the initial 9:16 waist-up UGC tests it reduced
+generation from roughly 50x real time to 20x while retaining good identity and
+quality. Actual speed and quality depend on framing, clip length, and hardware.
+
+For maximum speed, `--ugc-ultrafast` changes only the Stage 1 reference scale
+to `0.5`. Initial testing reached roughly 15x real time but showed noticeably
+more identity drift, so this preset is intended for previews and experiments:
+
+```bash
+uv run python -m ltx_pipelines_mlx.best_face_exact \
+  --character-sheet \
+  --reference character-sheet.png \
+  --prompt "ref_t2v: A woman speaks naturally to the camera." \
+  --ugc-ultrafast \
+  --frames 145 --frame-rate 24 \
+  -H 1024 -W 576 \
+  --seed 42 \
+  -o best-face-ugc-ultrafast.mp4
+```
 
 Each part can also be selected independently:
 
 ```text
 --stage1-steps 6
 --stage2-steps 2
---stage1-reference-scale 0.5
+--stage1-reference-scale 1.0
 --stage2-reference-scale 1.0
 --fast-refine
 ```

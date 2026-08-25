@@ -55,8 +55,9 @@ OFFICIAL_BASE_FACE_STRENGTH = 0.2
 OFFICIAL_SPATIAL_UPSCALER_FILE = "spatial_upscaler_x2_v1_1.safetensors"
 UGC_FAST_STAGE1_STEPS = 6
 UGC_FAST_STAGE2_STEPS = 2
-UGC_FAST_STAGE1_REFERENCE_SCALE = 0.5
+UGC_FAST_STAGE1_REFERENCE_SCALE = 1.0
 UGC_FAST_STAGE2_REFERENCE_SCALE = 1.0
+UGC_ULTRAFAST_STAGE1_REFERENCE_SCALE = 0.5
 
 
 def _sigma_schedule_for_steps(sigmas: list[float], steps: int | None) -> list[float]:
@@ -81,15 +82,22 @@ def _resolve_generation_settings(
     stage2_reference_scale: float | None,
     fast_refine: bool,
     ugc_fast: bool,
+    ugc_ultrafast: bool,
 ) -> tuple[int | None, int | None, float, float, bool]:
     """Resolve opt-in speed settings without changing parity defaults."""
-    if ugc_fast:
+    if ugc_fast and ugc_ultrafast:
+        raise ValueError("ugc_fast and ugc_ultrafast are mutually exclusive")
+    if ugc_fast or ugc_ultrafast:
         if stage1_steps is None:
             stage1_steps = UGC_FAST_STAGE1_STEPS
         if stage2_steps is None:
             stage2_steps = UGC_FAST_STAGE2_STEPS
         if stage1_reference_scale is None:
-            stage1_reference_scale = UGC_FAST_STAGE1_REFERENCE_SCALE
+            stage1_reference_scale = (
+                UGC_ULTRAFAST_STAGE1_REFERENCE_SCALE
+                if ugc_ultrafast
+                else UGC_FAST_STAGE1_REFERENCE_SCALE
+            )
         if stage2_reference_scale is None:
             stage2_reference_scale = UGC_FAST_STAGE2_REFERENCE_SCALE
         fast_refine = True
@@ -419,6 +427,7 @@ class BestFacePipeline(DistilledPipeline):
         stage2_reference_scale: float | None = None,
         fast_refine: bool = False,
         ugc_fast: bool = False,
+        ugc_ultrafast: bool = False,
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
@@ -448,6 +457,7 @@ class BestFacePipeline(DistilledPipeline):
             stage2_reference_scale=stage2_reference_scale,
             fast_refine=fast_refine,
             ugc_fast=ugc_fast,
+            ugc_ultrafast=ugc_ultrafast,
         )
 
         # The official character-sheet refine pass uses CFG++ at CFG 1. Its
@@ -702,6 +712,7 @@ class BestFacePipeline(DistilledPipeline):
         stage2_reference_scale: float | None = None,
         fast_refine: bool = False,
         ugc_fast: bool = False,
+        ugc_ultrafast: bool = False,
         source_id: float = 2.0,
         phase_scale: float = 1.0,
         reference_crf: int = 0,
@@ -729,6 +740,7 @@ class BestFacePipeline(DistilledPipeline):
             stage2_reference_scale=stage2_reference_scale,
             fast_refine=fast_refine,
             ugc_fast=ugc_fast,
+            ugc_ultrafast=ugc_ultrafast,
             source_id=source_id,
             phase_scale=phase_scale,
             reference_crf=reference_crf,
@@ -761,6 +773,7 @@ class BestFacePipeline(DistilledPipeline):
             stage2_reference_scale=stage2_reference_scale,
             fast_refine=fast_refine,
             ugc_fast=ugc_fast,
+            ugc_ultrafast=ugc_ultrafast,
         )
         _write_generation_metadata(
             saved_path,
@@ -774,6 +787,7 @@ class BestFacePipeline(DistilledPipeline):
                 "stage2_reference_scale": effective_stage2_reference_scale,
                 "fast_refine": effective_fast_refine,
                 "ugc_fast": ugc_fast,
+                "ugc_ultrafast": ugc_ultrafast,
                 "resize_mode": resize_mode,
                 "reference_crf": reference_crf,
                 "first_frame": str(Path(first_frame).expanduser().resolve()) if first_frame else None,
@@ -879,13 +893,21 @@ def main() -> None:
         action="store_true",
         help="Use a single conditioned Stage 2 pass instead of two-pass CFG++.",
     )
-    parser.add_argument(
+    speed_presets = parser.add_mutually_exclusive_group()
+    speed_presets.add_argument(
         "--ugc-fast",
         action="store_true",
         help=(
-            "Opt-in UGC speed preset: 6+2 steps, Stage 1 reference scale 0.5, "
-            "Stage 2 reference scale 1.0, and single-pass refinement. Explicit "
-            "stage/scale flags override preset values."
+            "Balanced UGC preset: 6+2 steps, native references in both stages, "
+            "and single-pass refinement. Explicit stage/scale flags override it."
+        ),
+    )
+    speed_presets.add_argument(
+        "--ugc-ultrafast",
+        action="store_true",
+        help=(
+            "Maximum-speed UGC preset: same as --ugc-fast but Stage 1 uses a "
+            "0.5 reference scale, trading more identity fidelity for speed."
         ),
     )
     parser.add_argument("--height", "-H", type=int, default=576)
@@ -951,6 +973,7 @@ def main() -> None:
         stage2_reference_scale=args.stage2_reference_scale,
         fast_refine=args.fast_refine,
         ugc_fast=args.ugc_fast,
+        ugc_ultrafast=args.ugc_ultrafast,
     )
     extra_loras = [(path, float(strength)) for path, strength in args.extra_lora]
 
@@ -1006,6 +1029,7 @@ def main() -> None:
         stage2_reference_scale=args.stage2_reference_scale,
         fast_refine=args.fast_refine,
         ugc_fast=args.ugc_fast,
+        ugc_ultrafast=args.ugc_ultrafast,
         source_id=args.source_id,
         phase_scale=args.phase_scale,
         reference_crf=args.reference_crf,
