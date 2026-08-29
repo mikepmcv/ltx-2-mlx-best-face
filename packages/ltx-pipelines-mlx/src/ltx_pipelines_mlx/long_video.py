@@ -16,6 +16,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from ltx_core_mlx.components.patchifiers import snap_output_dimensions
 from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
 
 from .best_face import (
@@ -359,6 +360,11 @@ def main() -> None:
         if args.limit_seconds <= 0:
             raise ValueError("limit-seconds must be greater than zero")
         duration = min(duration, args.limit_seconds)
+    args.height, args.width = snap_output_dimensions(
+        args.height,
+        args.width,
+        two_stage=True,
+    )
     plans = build_segment_plan(
         duration,
         max_segment_seconds=args.segment_seconds,
