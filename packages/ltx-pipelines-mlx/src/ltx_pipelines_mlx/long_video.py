@@ -335,7 +335,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-scale", type=float, default=1.0)
     parser.add_argument("--first-frame-strength", type=float, default=1.0)
     parser.add_argument("--keyframe-layout-blur", type=float, default=32.0)
-    parser.add_argument("--low-memory", action="store_true", help="Reload large components per shot; slower but uses less RAM")
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Reload large components per shot; slower but uses less RAM",
+    )
     parser.add_argument("--no-scene-lock-prompt", action="store_true")
     return parser
 
