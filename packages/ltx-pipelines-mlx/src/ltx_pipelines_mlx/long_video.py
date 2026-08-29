@@ -465,8 +465,8 @@ def main() -> None:
         segment_config = {
             **asdict(plan),
             "prompt": segment_prompt,
-            "first_frame": str(segment_frame),
-            "foreground_mask": str(segment_mask) if segment_mask else None,
+            "first_frame": fingerprint(segment_frame),
+            "foreground_mask": fingerprint(segment_mask),
             "seed": segment_seed,
             "run": run_hash,
         }
