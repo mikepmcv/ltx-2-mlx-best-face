@@ -150,6 +150,7 @@ def _lock_background(
     width: int,
     height: int,
     frame_rate: float,
+    duration: float,
     mask_feather: float,
 ) -> None:
     blur = f",gblur=sigma={mask_feather:g}" if mask_feather > 0 else ""
@@ -187,7 +188,8 @@ def _lock_background(
             "18",
             "-pix_fmt",
             "yuv420p",
-            "-shortest",
+            "-t",
+            f"{duration:.9f}",
             str(destination),
         ],
         label="locking the background",
@@ -527,6 +529,7 @@ def main() -> None:
                     width=args.width,
                     height=args.height,
                     frame_rate=args.frame_rate,
+                    duration=plan.output_duration,
                     mask_feather=args.mask_feather,
                 )
         visuals.append(visual_video)
