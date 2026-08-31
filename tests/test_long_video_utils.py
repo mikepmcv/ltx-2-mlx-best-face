@@ -28,12 +28,20 @@ def test_plan_has_no_cumulative_source_audio_gap():
     assert all((plan.num_frames - 1) % 8 == 0 for plan in plans)
 
 
-def test_last_segment_is_padded_only_at_the_end():
+def test_segments_are_balanced_and_only_frame_padded():
     plans = build_segment_plan(10.0, max_segment_seconds=8.0, frame_rate=24.0)
     assert len(plans) == 2
-    assert plans[0].source_duration == pytest.approx(plans[0].output_duration)
-    assert plans[1].output_duration >= plans[1].source_duration
+    assert plans[0].source_duration == pytest.approx(5.0)
+    assert plans[1].source_duration == pytest.approx(5.0)
+    assert all(plan.output_duration >= plan.source_duration for plan in plans)
     assert sum(plan.source_duration for plan in plans) == pytest.approx(10.0)
+
+
+def test_short_tail_is_balanced_across_segments():
+    plans = build_segment_plan(16.5, max_segment_seconds=8.0, frame_rate=24.0)
+    assert len(plans) == 3
+    assert [plan.source_duration for plan in plans] == pytest.approx([5.5, 5.5, 5.5])
+    assert all(plan.source_duration <= 8.0 for plan in plans)
 
 
 def test_config_hash_is_order_independent():

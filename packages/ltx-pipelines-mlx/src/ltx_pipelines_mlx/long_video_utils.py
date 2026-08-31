@@ -43,31 +43,32 @@ def build_segment_plan(
     if max_segment_seconds <= 0:
         raise ValueError("max_segment_seconds must be greater than zero")
 
-    standard_frames = snap_frame_count(max_segment_seconds, frame_rate)
-    standard_duration = standard_frames / frame_rate
+    # Split the source timeline evenly.  Filling max-sized shots greedily can
+    # leave a tiny final shot (for example 16.5s -> 8s + 8s + 0.5s).  Very
+    # short audio conditionings are unreliable and often produce a frozen
+    # mouth, so distribute the same audio over equally useful shots instead.
+    segment_count = max(1, math.ceil(audio_duration / max_segment_seconds))
+    target_duration = audio_duration / segment_count
     plans: list[SegmentPlan] = []
     start = 0.0
-    epsilon = 1e-7
 
-    while start < audio_duration - epsilon:
-        remaining = audio_duration - start
-        source_duration = min(standard_duration, remaining)
-        frames = (
-            standard_frames
-            if remaining >= standard_duration - epsilon
-            else snap_frame_count(source_duration, frame_rate)
-        )
+    for index in range(segment_count):
+        # Compute the final boundary from the total duration rather than by
+        # repeated addition, avoiding cumulative floating-point drift.
+        end = audio_duration if index == segment_count - 1 else target_duration * (index + 1)
+        source_duration = end - start
+        frames = snap_frame_count(source_duration, frame_rate)
         output_duration = frames / frame_rate
         plans.append(
             SegmentPlan(
-                index=len(plans),
+                index=index,
                 start_time=start,
                 source_duration=source_duration,
                 num_frames=frames,
                 output_duration=output_duration,
             )
         )
-        start += source_duration
+        start = end
 
     return plans
 

@@ -141,6 +141,29 @@ def _normalise_video(source: Path, destination: Path, *, frame_rate: float) -> N
     )
 
 
+def _extract_last_frame(source: Path, destination: Path) -> None:
+    """Extract a lossless handoff frame from a completed visual segment."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-sseof",
+            "-0.08",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "png",
+            str(destination),
+        ],
+        label="extracting the segment handoff frame",
+    )
+
+
 def _lock_background(
     *,
     generated: Path,
@@ -333,10 +356,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", "-W", type=int, default=576)
     parser.add_argument("--frame-rate", type=float, default=24.0)
     parser.add_argument("--seed", type=int, default=-1)
-    parser.add_argument("--quality", choices=["standard", "fast", "ultrafast"], default="fast")
+    parser.add_argument(
+        "--quality",
+        choices=["standard", "balanced", "fast", "ultrafast"],
+        default="fast",
+        help=(
+            "balanced uses 7+3 denoising steps for better eyes/teeth at a "
+            "smaller cost than the full standard preset"
+        ),
+    )
     parser.add_argument("--reference-scale", type=float, default=1.0)
     parser.add_argument("--first-frame-strength", type=float, default=1.0)
     parser.add_argument("--keyframe-layout-blur", type=float, default=32.0)
+    parser.add_argument(
+        "--segment-handoff",
+        choices=["previous", "master"],
+        default="previous",
+        help=(
+            "Use the preceding generated end frame to start each new segment "
+            "(default), or restart every segment from --first-frame."
+        ),
+    )
     parser.add_argument(
         "--low-memory",
         action="store_true",
@@ -386,7 +426,8 @@ def main() -> None:
     audio_dir = work_dir / "audio"
     raw_dir = work_dir / "raw"
     visual_dir = work_dir / "visual"
-    for directory in (audio_dir, raw_dir, visual_dir):
+    handoff_dir = work_dir / "handoff"
+    for directory in (audio_dir, raw_dir, visual_dir, handoff_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     if args.seed < 0:
@@ -426,6 +467,7 @@ def main() -> None:
         "quality": args.quality,
         "reference_scale": args.reference_scale,
         "first_frame_strength": args.first_frame_strength,
+        "segment_handoff": args.segment_handoff,
         "mask_feather": args.mask_feather,
         "seed": args.seed,
         "plans": serialise_plan(plans),
@@ -453,7 +495,18 @@ def main() -> None:
         segment_prompt = str(override.get("prompt", args.prompt)).strip()
         if not args.no_scene_lock_prompt:
             segment_prompt = f"{segment_prompt} {SCENE_LOCK}"
-        segment_frame = Path(override.get("first_frame", first_frame)).expanduser().resolve()
+        override_frame = override.get("first_frame")
+        if override_frame is not None:
+            segment_frame = Path(override_frame).expanduser().resolve()
+        elif plan.index > 0 and args.segment_handoff == "previous":
+            previous_visual = visuals[-1]
+            # The previous visual stem includes its config hash, preventing a
+            # stale handoff image from being reused after prompt/seed changes.
+            segment_frame = handoff_dir / f"{previous_visual.stem}-handoff.png"
+            if not segment_frame.is_file():
+                _extract_last_frame(previous_visual, segment_frame)
+        else:
+            segment_frame = first_frame
         segment_mask_raw = override.get("foreground_mask", foreground_mask)
         segment_mask = Path(segment_mask_raw).expanduser().resolve() if segment_mask_raw else None
         segment_seed = int(override.get("seed", args.seed + plan.index))
@@ -504,6 +557,9 @@ def main() -> None:
                 seed=segment_seed,
                 resize_mode=resize_mode,
                 reference_scale=args.reference_scale,
+                stage1_steps=7 if args.quality == "balanced" else None,
+                stage2_steps=3 if args.quality == "balanced" else None,
+                fast_refine=args.quality == "balanced",
                 ugc_fast=args.quality == "fast",
                 ugc_ultrafast=args.quality == "ultrafast",
                 first_frame=str(segment_frame),
@@ -549,6 +605,7 @@ def main() -> None:
         "segments": [str(path) for path in visuals],
         "audio_mode": "locked_original_tts_only",
         "background_mode": "masked_pixel_lock" if foreground_mask else "first_frame_anchor",
+        "segment_handoff": args.segment_handoff,
     }
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
