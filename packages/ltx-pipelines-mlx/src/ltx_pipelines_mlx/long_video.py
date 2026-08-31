@@ -16,6 +16,8 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from PIL import Image
+
 from ltx_core_mlx.components.patchifiers import snap_output_dimensions
 from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
 
@@ -123,11 +125,14 @@ def _normalise_video(
     frame_rate: float,
     duration: float,
     trim_start_frames: int = 0,
+    brightness_correction: float = 0.0,
 ) -> None:
     filters = []
     if trim_start_frames > 0:
         filters.append(f"trim=start_frame={trim_start_frames}")
         filters.append("setpts=PTS-STARTPTS")
+    if abs(brightness_correction) > 1e-6:
+        filters.append(f"eq=brightness={brightness_correction:.8f}:eval=init")
     command = [
         find_ffmpeg(),
         "-y",
@@ -160,6 +165,88 @@ def _normalise_video(
         command,
         label="stripping model audio",
     )
+
+
+def _extract_analysis_frame(
+    source: Path,
+    destination: Path,
+    *,
+    frame_index: int,
+) -> None:
+    """Extract the first visible frame used for per-segment light matching."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            f"select=eq(n\\,{frame_index})",
+            "-frames:v",
+            "1",
+            str(destination),
+        ],
+        label="sampling segment lighting",
+    )
+
+
+def _stable_luma(
+    image_path: Path,
+    *,
+    foreground_mask: Path | None,
+) -> float:
+    """Measure background/border luminance without weighting the central face."""
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+        analysis_width = min(256, image.width)
+        analysis_height = max(1, round(image.height * analysis_width / image.width))
+        image = image.resize((analysis_width, analysis_height), Image.Resampling.BILINEAR)
+    mask = None
+    if foreground_mask is not None:
+        with Image.open(foreground_mask) as source_mask:
+            mask = source_mask.convert("L").resize(
+                image.size,
+                Image.Resampling.BILINEAR,
+            )
+
+    pixels = image.load()
+    mask_pixels = mask.load() if mask is not None else None
+    width, height = image.size
+    side = max(1, width // 8)
+    top = max(1, height // 10)
+    total = 0.0
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            if mask_pixels is not None:
+                use_pixel = mask_pixels[x, y] <= 64
+            else:
+                use_pixel = x < side or x >= width - side or y < top
+            if not use_pixel:
+                continue
+            red, green, blue = pixels[x, y]
+            total += 0.2126 * red + 0.7152 * green + 0.0722 * blue
+            count += 1
+    if count < 64:
+        raise ValueError("lighting-match region contains too few background pixels")
+    return total / count
+
+
+def _measure_brightness_correction(
+    *,
+    master_frame: Path,
+    generated_frame: Path,
+    foreground_mask: Path | None,
+    maximum: float,
+) -> float:
+    """Return a conservative fixed FFmpeg ``eq`` brightness correction."""
+    if maximum < 0:
+        raise ValueError("lighting-match-max must be zero or greater")
+    target = _stable_luma(master_frame, foreground_mask=foreground_mask)
+    actual = _stable_luma(generated_frame, foreground_mask=foreground_mask)
+    correction = (target - actual) / 255.0
+    return max(-maximum, min(maximum, correction))
 
 
 def _extract_last_frame(source: Path, destination: Path) -> None:
@@ -253,6 +340,7 @@ def _lock_background(
     duration: float,
     mask_feather: float,
     trim_start_frames: int = 0,
+    brightness_correction: float = 0.0,
 ) -> None:
     blur = f",gblur=sigma={mask_feather:g}" if mask_feather > 0 else ""
     trim = (
@@ -260,8 +348,13 @@ def _lock_background(
         if trim_start_frames > 0
         else ""
     )
+    correction = (
+        f"eq=brightness={brightness_correction:.8f}:eval=init,"
+        if abs(brightness_correction) > 1e-6
+        else ""
+    )
     graph = (
-        f"[0:v]{trim}format=yuv420p[generated];"
+        f"[0:v]{trim}{correction}format=yuv420p[generated];"
         f"[1:v]scale={width}:{height},format=yuv420p[bg];"
         f"[2:v]scale={width}:{height},format=gray{blur}[mask];"
         "[bg][generated][mask]maskedmerge,format=yuv420p[outv]"
@@ -470,6 +563,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Encode and cache all segment TTS conditionings before the first generation (default).",
     )
+    parser.add_argument(
+        "--lighting-match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply one conservative background-derived exposure correction per segment (default).",
+    )
+    parser.add_argument(
+        "--lighting-match-max",
+        type=float,
+        default=0.08,
+        help="Maximum absolute FFmpeg brightness correction per segment (default: 0.08).",
+    )
     parser.add_argument("--no-scene-lock-prompt", action="store_true")
     return parser
 
@@ -492,6 +597,8 @@ def main() -> None:
         raise ValueError("handoff-fade-frames must be zero or greater")
     if args.segment_preroll_frames < 0:
         raise ValueError("segment-preroll-frames must be zero or greater")
+    if args.lighting_match_max < 0:
+        raise ValueError("lighting-match-max must be zero or greater")
 
     duration = _probe_duration(audio)
     if args.limit_seconds is not None:
@@ -565,6 +672,8 @@ def main() -> None:
         "segment_preroll_frames": args.segment_preroll_frames,
         "preencode_audio": args.preencode_audio,
         "latent_upscale": "official_two_stage_spatial_upscaler",
+        "lighting_match": args.lighting_match,
+        "lighting_match_max": args.lighting_match_max,
         "mask_feather": args.mask_feather,
         "seed": args.seed,
         "plans": serialise_plan(plans),
@@ -740,6 +849,25 @@ def main() -> None:
                 else visual_video
             )
             if not base_visual.is_file():
+                brightness_correction = 0.0
+                if args.lighting_match and args.lighting_match_max > 0:
+                    analysis_frame = visual_dir / f"{stem}.lighting.png"
+                    if not analysis_frame.is_file():
+                        _extract_analysis_frame(
+                            raw_video,
+                            analysis_frame,
+                            frame_index=window.preroll_frames,
+                        )
+                    brightness_correction = _measure_brightness_correction(
+                        master_frame=segment_frame,
+                        generated_frame=analysis_frame,
+                        foreground_mask=segment_mask,
+                        maximum=args.lighting_match_max,
+                    )
+                    print(
+                        f"[{plan.index + 1}/{len(plans)}] lighting correction "
+                        f"{brightness_correction:+.4f}"
+                    )
                 if segment_mask is None:
                     _normalise_video(
                         raw_video,
@@ -747,6 +875,7 @@ def main() -> None:
                         frame_rate=args.frame_rate,
                         duration=plan.source_duration,
                         trim_start_frames=window.preroll_frames,
+                        brightness_correction=brightness_correction,
                     )
                 else:
                     _lock_background(
@@ -760,6 +889,7 @@ def main() -> None:
                         duration=plan.source_duration,
                         mask_feather=args.mask_feather,
                         trim_start_frames=window.preroll_frames,
+                        brightness_correction=brightness_correction,
                     )
             if needs_handoff_blend:
                 _soften_segment_start(
@@ -794,6 +924,8 @@ def main() -> None:
         "preencode_audio": args.preencode_audio,
         "model_residency": "low_memory_reload" if args.low_memory else "warm_across_segments",
         "latent_upscale": "official_two_stage_spatial_upscaler",
+        "lighting_match": args.lighting_match,
+        "lighting_match_max": args.lighting_match_max,
     }
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",

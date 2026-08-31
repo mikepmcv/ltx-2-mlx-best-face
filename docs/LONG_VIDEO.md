@@ -34,6 +34,7 @@ uv run python -m ltx_pipelines_mlx.long_video \
   --segment-preroll-frames 16 \
   --transition hard \
   --preencode-audio \
+  --lighting-match \
   --quality fast \
   -H 1024 -W 576 \
   -o ten-minute-presenter.mp4
@@ -111,6 +112,20 @@ half resolution, the official LTX spatial upscaler enlarges the latent, and
 Stage 2 refines it at output resolution. There is therefore no separate final
 MP4 latent-upscale switch. Use `--quality balanced` for three Stage 2 detail
 passes when eyes and teeth matter; `fast` uses the quicker two-pass refine.
+
+## Segment lighting match
+
+`--lighting-match` is enabled by default. It compares the first visible frame
+of each generated segment with that segment's clean master frame. With a
+foreground mask it measures only the mask's black, stable background region;
+without one it samples conservative outer-border regions to avoid weighting
+the presenter's face.
+
+One fixed, clamped exposure correction is then applied during the segment's
+existing H.264 encode. It performs no temporal filtering, interpolation, blur,
+or additional encode, so it does not reduce facial sharpness. The default
+`--lighting-match-max 0.08` prevents large corrections. Disable the experiment
+at any time with `--no-lighting-match`; the cache key changes automatically.
 
 ## One supplied-audio shot
 
