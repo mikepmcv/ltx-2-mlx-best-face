@@ -21,6 +21,17 @@ class SegmentPlan:
     output_duration: float
 
 
+@dataclass(frozen=True)
+class ConditioningWindow:
+    """Generation window containing disposable audio/video preroll."""
+
+    start_time: float
+    source_duration: float
+    preroll_frames: int
+    num_frames: int
+    output_duration: float
+
+
 def snap_frame_count(duration: float, frame_rate: float) -> int:
     """Return the smallest LTX-valid ``8k + 1`` count covering duration."""
     if duration <= 0:
@@ -73,6 +84,31 @@ def build_segment_plan(
     return plans
 
 
+def build_conditioning_window(
+    plan: SegmentPlan,
+    *,
+    frame_rate: float,
+    preroll_frames: int,
+) -> ConditioningWindow:
+    """Extend a segment backwards by whole frames for disposable preroll."""
+    if frame_rate <= 0:
+        raise ValueError("frame_rate must be greater than zero")
+    if preroll_frames < 0:
+        raise ValueError("preroll_frames must be zero or greater")
+    available_frames = max(0, math.floor(plan.start_time * frame_rate + 1e-7))
+    actual_preroll = min(preroll_frames, available_frames)
+    preroll_duration = actual_preroll / frame_rate
+    source_duration = plan.source_duration + preroll_duration
+    num_frames = snap_frame_count(source_duration, frame_rate)
+    return ConditioningWindow(
+        start_time=plan.start_time - preroll_duration,
+        source_duration=source_duration,
+        preroll_frames=actual_preroll,
+        num_frames=num_frames,
+        output_duration=num_frames / frame_rate,
+    )
+
+
 def stable_config_hash(value: Any, length: int = 12) -> str:
     """Return a short deterministic digest for resumable segment filenames."""
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
@@ -90,7 +126,9 @@ def concat_file_line(path: str | Path) -> str:
 
 
 __all__ = [
+    "ConditioningWindow",
     "SegmentPlan",
+    "build_conditioning_window",
     "build_segment_plan",
     "concat_file_line",
     "serialise_plan",

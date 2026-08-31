@@ -2,7 +2,7 @@
 
 The model still renders short shots. This module keeps identity and scene
 conditioning fresh on every shot, strips every generated audio stream, and
-muxes only PCM copied from the supplied TTS recording into the final video.
+muxes the original continuous TTS recording into the final video.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from .best_face import (
 )
 from .long_video_utils import (
     SegmentPlan,
+    build_conditioning_window,
     build_segment_plan,
     concat_file_line,
     serialise_plan,
@@ -121,16 +122,25 @@ def _normalise_video(
     *,
     frame_rate: float,
     duration: float,
+    trim_start_frames: int = 0,
 ) -> None:
-    _run(
+    filters = []
+    if trim_start_frames > 0:
+        filters.append(f"trim=start_frame={trim_start_frames}")
+        filters.append("setpts=PTS-STARTPTS")
+    command = [
+        find_ffmpeg(),
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    if filters:
+        command.extend(["-vf", ",".join(filters)])
+    command.extend(
         [
-            find_ffmpeg(),
-            "-y",
-            "-i",
-            str(source),
-            "-map",
-            "0:v:0",
-            "-an",
             "-r",
             f"{frame_rate:g}",
             "-c:v",
@@ -144,7 +154,10 @@ def _normalise_video(
             "-t",
             f"{duration:.9f}",
             str(destination),
-        ],
+        ]
+    )
+    _run(
+        command,
         label="stripping model audio",
     )
 
@@ -239,12 +252,19 @@ def _lock_background(
     frame_rate: float,
     duration: float,
     mask_feather: float,
+    trim_start_frames: int = 0,
 ) -> None:
     blur = f",gblur=sigma={mask_feather:g}" if mask_feather > 0 else ""
+    trim = (
+        f"trim=start_frame={trim_start_frames},setpts=PTS-STARTPTS,"
+        if trim_start_frames > 0
+        else ""
+    )
     graph = (
+        f"[0:v]{trim}format=yuv420p[generated];"
         f"[1:v]scale={width}:{height},format=yuv420p[bg];"
         f"[2:v]scale={width}:{height},format=gray{blur}[mask];"
-        "[bg][0:v][mask]maskedmerge,format=yuv420p[outv]"
+        "[bg][generated][mask]maskedmerge,format=yuv420p[outv]"
     )
     _run(
         [
@@ -415,17 +435,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--segment-handoff",
         choices=["previous", "master"],
-        default="previous",
+        default="master",
         help=(
-            "Use the preceding generated end frame to start each new segment "
-            "(default), or restart every segment from --first-frame."
+            "Restart every segment from --first-frame (default), or use the "
+            "preceding generated end frame with 'previous'."
         ),
     )
     parser.add_argument(
         "--handoff-fade-frames",
         type=int,
         default=3,
-        help="Blend this many opening frames with the preceding end frame; 0 disables it.",
+        help="For --transition fade, blend this many opening frames.",
+    )
+    parser.add_argument(
+        "--transition",
+        choices=["hard", "fade"],
+        default="hard",
+        help="Use direct creator-style cuts by default; fade applies only to previous-frame handoffs.",
+    )
+    parser.add_argument(
+        "--segment-preroll-frames",
+        type=int,
+        default=16,
+        help="Generate and discard this many frames before master-frame segments after the first.",
     )
     parser.add_argument(
         "--low-memory",
@@ -452,6 +484,8 @@ def main() -> None:
         raise FileNotFoundError(f"foreground mask does not exist: {foreground_mask}")
     if args.handoff_fade_frames < 0:
         raise ValueError("handoff-fade-frames must be zero or greater")
+    if args.segment_preroll_frames < 0:
+        raise ValueError("segment-preroll-frames must be zero or greater")
 
     duration = _probe_duration(audio)
     if args.limit_seconds is not None:
@@ -521,6 +555,8 @@ def main() -> None:
         "first_frame_strength": args.first_frame_strength,
         "segment_handoff": args.segment_handoff,
         "handoff_fade_frames": args.handoff_fade_frames,
+        "transition": args.transition,
+        "segment_preroll_frames": args.segment_preroll_frames,
         "mask_feather": args.mask_feather,
         "seed": args.seed,
         "plans": serialise_plan(plans),
@@ -562,6 +598,15 @@ def main() -> None:
         segment_mask_raw = override.get("foreground_mask", foreground_mask)
         segment_mask = Path(segment_mask_raw).expanduser().resolve() if segment_mask_raw else None
         segment_seed = int(override.get("seed", args.seed + plan.index))
+        use_master_preroll = (
+            plan.index > 0
+            and (args.segment_handoff == "master" or override_frame is not None)
+        )
+        window = build_conditioning_window(
+            plan,
+            frame_rate=args.frame_rate,
+            preroll_frames=args.segment_preroll_frames if use_master_preroll else 0,
+        )
         if not segment_frame.is_file():
             raise FileNotFoundError(f"segment {plan.index} first frame does not exist: {segment_frame}")
         if segment_mask is not None and not segment_mask.is_file():
@@ -569,6 +614,7 @@ def main() -> None:
 
         segment_config = {
             **asdict(plan),
+            "conditioning_window": asdict(window),
             "prompt": segment_prompt,
             "first_frame": fingerprint(segment_frame),
             "foreground_mask": fingerprint(segment_mask),
@@ -582,7 +628,18 @@ def main() -> None:
         visual_video = visual_dir / f"{stem}.mp4"
 
         if not chunk_audio.is_file():
-            _extract_padded_pcm(source=audio, plan=plan, destination=chunk_audio)
+            conditioning_plan = SegmentPlan(
+                index=plan.index,
+                start_time=window.start_time,
+                source_duration=window.source_duration,
+                num_frames=window.num_frames,
+                output_duration=window.output_duration,
+            )
+            _extract_padded_pcm(
+                source=audio,
+                plan=conditioning_plan,
+                destination=chunk_audio,
+            )
 
         if not raw_video.is_file():
             if pipe is None:
@@ -597,14 +654,18 @@ def main() -> None:
                     extra_loras=extra_loras,
                     low_memory=args.low_memory,
                 )
-            print(f"[{plan.index + 1}/{len(plans)}] generating {plan.output_duration:.2f}s")
+            print(
+                f"[{plan.index + 1}/{len(plans)}] generating "
+                f"{window.output_duration:.2f}s "
+                f"({window.preroll_frames} preroll frames)"
+            )
             pipe.generate_and_save_best_face(
                 prompt=segment_prompt,
                 reference=str(reference),
                 output_path=str(raw_video),
                 height=args.height,
                 width=args.width,
-                num_frames=plan.num_frames,
+                num_frames=window.num_frames,
                 frame_rate=args.frame_rate,
                 seed=segment_seed,
                 resize_mode=resize_mode,
@@ -620,7 +681,7 @@ def main() -> None:
                 keyframe_layout_blur=args.keyframe_layout_blur,
                 audio_path=str(chunk_audio),
                 audio_start_time=0.0,
-                audio_max_duration=plan.output_duration,
+                audio_max_duration=window.output_duration,
             )
         else:
             print(f"[{plan.index + 1}/{len(plans)}] resuming existing shot")
@@ -630,6 +691,7 @@ def main() -> None:
                 plan.index > 0
                 and args.segment_handoff == "previous"
                 and override_frame is None
+                and args.transition == "fade"
                 and args.handoff_fade_frames > 0
             )
             base_visual = (
@@ -644,6 +706,7 @@ def main() -> None:
                         base_visual,
                         frame_rate=args.frame_rate,
                         duration=plan.source_duration,
+                        trim_start_frames=window.preroll_frames,
                     )
                 else:
                     _lock_background(
@@ -656,6 +719,7 @@ def main() -> None:
                         frame_rate=args.frame_rate,
                         duration=plan.source_duration,
                         mask_feather=args.mask_feather,
+                        trim_start_frames=window.preroll_frames,
                     )
             if needs_handoff_blend:
                 _soften_segment_start(
@@ -685,6 +749,8 @@ def main() -> None:
         "audio_mode": "direct_original_tts_track",
         "background_mode": "masked_pixel_lock" if foreground_mask else "first_frame_anchor",
         "segment_handoff": args.segment_handoff,
+        "transition": args.transition,
+        "segment_preroll_frames": args.segment_preroll_frames,
     }
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",

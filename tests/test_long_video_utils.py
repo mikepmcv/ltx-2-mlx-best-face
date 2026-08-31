@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from ltx_pipelines_mlx.long_video_utils import (
+    build_conditioning_window,
     build_segment_plan,
     concat_file_line,
     snap_frame_count,
@@ -42,6 +43,23 @@ def test_short_tail_is_balanced_across_segments():
     assert len(plans) == 3
     assert [plan.source_duration for plan in plans] == pytest.approx([5.5, 5.5, 5.5])
     assert all(plan.source_duration <= 8.0 for plan in plans)
+
+
+def test_master_segment_preroll_extends_generation_backwards():
+    plan = build_segment_plan(16.0, max_segment_seconds=8.0, frame_rate=24.0)[1]
+    window = build_conditioning_window(plan, frame_rate=24.0, preroll_frames=16)
+    assert window.preroll_frames == 16
+    assert window.start_time == pytest.approx(plan.start_time - 16 / 24)
+    assert window.source_duration == pytest.approx(plan.source_duration + 16 / 24)
+    assert (window.num_frames - 1) % 8 == 0
+    assert window.output_duration >= window.source_duration
+
+
+def test_preroll_is_clamped_at_start_of_timeline():
+    plan = build_segment_plan(1.0, max_segment_seconds=8.0, frame_rate=24.0)[0]
+    window = build_conditioning_window(plan, frame_rate=24.0, preroll_frames=16)
+    assert window.preroll_frames == 0
+    assert window.start_time == 0
 
 
 def test_config_hash_is_order_independent():

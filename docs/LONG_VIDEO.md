@@ -3,8 +3,14 @@
 This workflow creates long talking-head videos as resumable short shots. Every
 shot reuses the same Best Face identity reference and master scene frame. The
 supplied TTS is frozen in the audio latent to drive facial motion. Model audio
-is stripped from every shot; the final file contains only PCM copied from the
-original TTS recording.
+is stripped from every shot; the original continuous TTS recording is muxed
+directly into the final video so segment processing cannot add audio gaps.
+
+By default every segment restarts from the master scene frame, receives 16
+frames of hidden audio/video preroll, discards that preroll, and joins the
+previous segment with a hard creator-style cut. This avoids cumulative
+softening from repeatedly feeding generated end frames back into the model,
+while letting the mouth begin moving before each visible cut.
 
 ## Ten-minute portrait example
 
@@ -24,14 +30,19 @@ uv run python -m ltx_pipelines_mlx.long_video \
   --foreground-mask presenter-mask.png \
   --prompt "A presenter speaks naturally to camera with subtle expressions and restrained hand gestures." \
   --segment-seconds 8 \
+  --segment-handoff master \
+  --segment-preroll-frames 16 \
+  --transition hard \
   --quality fast \
   -H 1024 -W 576 \
   -o ten-minute-presenter.mp4
 ```
 
 At 24 fps, the default eight-second plan uses 193-frame shots. A ten-minute
-recording becomes about 75 independent generations. The final shot is padded
-with silence only when required to reach an `8k + 1` frame count.
+recording becomes about 75 independent generations. Later shots include a
+hidden 16-frame preroll. Each generated conditioning window is padded only
+when required to reach an `8k + 1` frame count, then trimmed back to the exact
+source timeline before assembly.
 
 The default work directory is `ten-minute-presenter.mp4.work`. Completed audio,
 raw, and visual segments are content-addressed and reused automatically when
@@ -54,15 +65,31 @@ area. `--mask-feather 6` softens its edge; increase or decrease it as needed.
 
 For each shot the orchestrator:
 
-1. copies the correct TTS interval to a 48 kHz PCM WAV;
+1. copies the TTS interval plus any hidden preroll to a 48 kHz PCM WAV;
 2. freezes its encoded audio tokens through both Best Face denoising stages;
 3. uses those tokens for joint audio/video lip movement;
 4. strips the complete audio stream from the model output;
-5. concatenates the original PCM intervals and muxes that track into the final
-   MP4.
+5. muxes the original, unsegmented source recording directly into the final
+   MP4 timeline.
 
 Consequently generated dialogue, ambience, music, or LTX audio-VAE output
 cannot reach the finished file.
+
+## Segment continuity
+
+The default `--segment-handoff master --transition hard` mode is intended for
+long UGC and YouTube-style speech. It trades tiny pose changes at cuts for
+stable long-term sharpness: every segment starts from the same clean master
+frame rather than a progressively softer generated frame.
+
+`--segment-preroll-frames 16` begins conditioning roughly 0.67 seconds before
+each cut at 24 fps, then removes those 16 frames exactly. The visible segment
+therefore starts at the correct audio timestamp with speech already in motion,
+instead of repeatedly revealing the master frame's closed mouth.
+
+For the older continuous-handoff behavior, use `--segment-handoff previous`.
+Add `--transition fade` if a short visual blend is preferred, although that
+mode can accumulate softness over a long video.
 
 ## One supplied-audio shot
 
