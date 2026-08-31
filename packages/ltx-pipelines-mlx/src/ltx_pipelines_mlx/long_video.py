@@ -115,7 +115,13 @@ def _extract_padded_pcm(
     )
 
 
-def _normalise_video(source: Path, destination: Path, *, frame_rate: float) -> None:
+def _normalise_video(
+    source: Path,
+    destination: Path,
+    *,
+    frame_rate: float,
+    duration: float,
+) -> None:
     _run(
         [
             find_ffmpeg(),
@@ -135,6 +141,8 @@ def _normalise_video(source: Path, destination: Path, *, frame_rate: float) -> N
             "18",
             "-pix_fmt",
             "yuv420p",
+            "-t",
+            f"{duration:.9f}",
             str(destination),
         ],
         label="stripping model audio",
@@ -149,11 +157,13 @@ def _extract_last_frame(source: Path, destination: Path) -> None:
             find_ffmpeg(),
             "-y",
             "-sseof",
-            "-0.08",
+            "-1",
             "-i",
             str(source),
             "-map",
             "0:v:0",
+            "-vf",
+            "reverse",
             "-frames:v",
             "1",
             "-c:v",
@@ -161,6 +171,60 @@ def _extract_last_frame(source: Path, destination: Path) -> None:
             str(destination),
         ],
         label="extracting the segment handoff frame",
+    )
+
+
+def _soften_segment_start(
+    *,
+    generated: Path,
+    handoff_frame: Path,
+    destination: Path,
+    width: int,
+    height: int,
+    frame_rate: float,
+    duration: float,
+    fade_frames: int,
+) -> None:
+    """Blend a handoff still over the first few frames to hide relighting."""
+    if fade_frames <= 0:
+        shutil.copy2(generated, destination)
+        return
+    fade_duration = fade_frames / frame_rate
+    graph = (
+        f"[1:v]scale={width}:{height},format=rgba,"
+        f"fade=t=out:st=0:d={fade_duration:.9f}:alpha=1[handoff];"
+        "[0:v][handoff]overlay=shortest=1,format=yuv420p[outv]"
+    )
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-i",
+            str(generated),
+            "-loop",
+            "1",
+            "-i",
+            str(handoff_frame),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[outv]",
+            "-an",
+            "-r",
+            f"{frame_rate:g}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-t",
+            f"{duration:.9f}",
+            str(destination),
+        ],
+        label="softening the segment handoff",
     )
 
 
@@ -229,16 +293,13 @@ def _write_concat_list(paths: list[Path], destination: Path) -> None:
 def _assemble(
     *,
     visual_segments: list[Path],
-    audio_segments: list[Path],
+    original_audio: Path,
     work_dir: Path,
     output: Path,
 ) -> None:
     video_list = work_dir / "video-concat.txt"
-    audio_list = work_dir / "audio-concat.txt"
     silent_video = work_dir / "assembled-video.mp4"
-    assembled_audio = work_dir / "assembled-original-tts.wav"
     _write_concat_list(visual_segments, video_list)
-    _write_concat_list(audio_segments, audio_list)
 
     _run(
         [
@@ -259,23 +320,6 @@ def _assemble(
         ],
         label="concatenating video segments",
     )
-    _run(
-        [
-            find_ffmpeg(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(audio_list),
-            "-c:a",
-            "pcm_s16le",
-            str(assembled_audio),
-        ],
-        label="concatenating original TTS segments",
-    )
-
     output.parent.mkdir(parents=True, exist_ok=True)
     _run(
         [
@@ -284,7 +328,7 @@ def _assemble(
             "-i",
             str(silent_video),
             "-i",
-            str(assembled_audio),
+            str(original_audio),
             "-map",
             "0:v:0",
             "-map",
@@ -300,7 +344,7 @@ def _assemble(
             "+faststart",
             str(output),
         ],
-        label="muxing the untouched TTS track",
+        label="muxing the original continuous TTS track",
     )
 
 
@@ -378,6 +422,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--handoff-fade-frames",
+        type=int,
+        default=3,
+        help="Blend this many opening frames with the preceding end frame; 0 disables it.",
+    )
+    parser.add_argument(
         "--low-memory",
         action="store_true",
         help="Reload large components per shot; slower but uses less RAM",
@@ -400,6 +450,8 @@ def main() -> None:
             raise FileNotFoundError(f"{label} does not exist: {path}")
     if foreground_mask is not None and not foreground_mask.is_file():
         raise FileNotFoundError(f"foreground mask does not exist: {foreground_mask}")
+    if args.handoff_fade_frames < 0:
+        raise ValueError("handoff-fade-frames must be zero or greater")
 
     duration = _probe_duration(audio)
     if args.limit_seconds is not None:
@@ -468,6 +520,7 @@ def main() -> None:
         "reference_scale": args.reference_scale,
         "first_frame_strength": args.first_frame_strength,
         "segment_handoff": args.segment_handoff,
+        "handoff_fade_frames": args.handoff_fade_frames,
         "mask_feather": args.mask_feather,
         "seed": args.seed,
         "plans": serialise_plan(plans),
@@ -487,7 +540,6 @@ def main() -> None:
 
     pipe: BestFacePipeline | None = None
     visuals: list[Path] = []
-    audio_chunks: list[Path] = []
     started = time.time()
 
     for plan in plans:
@@ -574,26 +626,53 @@ def main() -> None:
             print(f"[{plan.index + 1}/{len(plans)}] resuming existing shot")
 
         if not visual_video.is_file():
-            if segment_mask is None:
-                _normalise_video(raw_video, visual_video, frame_rate=args.frame_rate)
-            else:
-                _lock_background(
-                    generated=raw_video,
-                    background=segment_frame,
-                    foreground_mask=segment_mask,
+            needs_handoff_blend = (
+                plan.index > 0
+                and args.segment_handoff == "previous"
+                and override_frame is None
+                and args.handoff_fade_frames > 0
+            )
+            base_visual = (
+                visual_dir / f"{stem}.unblended.mp4"
+                if needs_handoff_blend
+                else visual_video
+            )
+            if not base_visual.is_file():
+                if segment_mask is None:
+                    _normalise_video(
+                        raw_video,
+                        base_visual,
+                        frame_rate=args.frame_rate,
+                        duration=plan.source_duration,
+                    )
+                else:
+                    _lock_background(
+                        generated=raw_video,
+                        background=segment_frame,
+                        foreground_mask=segment_mask,
+                        destination=base_visual,
+                        width=args.width,
+                        height=args.height,
+                        frame_rate=args.frame_rate,
+                        duration=plan.source_duration,
+                        mask_feather=args.mask_feather,
+                    )
+            if needs_handoff_blend:
+                _soften_segment_start(
+                    generated=base_visual,
+                    handoff_frame=segment_frame,
                     destination=visual_video,
                     width=args.width,
                     height=args.height,
                     frame_rate=args.frame_rate,
-                    duration=plan.output_duration,
-                    mask_feather=args.mask_feather,
+                    duration=plan.source_duration,
+                    fade_frames=args.handoff_fade_frames,
                 )
         visuals.append(visual_video)
-        audio_chunks.append(chunk_audio)
 
     _assemble(
         visual_segments=visuals,
-        audio_segments=audio_chunks,
+        original_audio=audio,
         work_dir=work_dir,
         output=output,
     )
@@ -603,7 +682,7 @@ def main() -> None:
         "work_dir": str(work_dir),
         "elapsed_seconds": time.time() - started,
         "segments": [str(path) for path in visuals],
-        "audio_mode": "locked_original_tts_only",
+        "audio_mode": "direct_original_tts_track",
         "background_mode": "masked_pixel_lock" if foreground_mask else "first_frame_anchor",
         "segment_handoff": args.segment_handoff,
     }
