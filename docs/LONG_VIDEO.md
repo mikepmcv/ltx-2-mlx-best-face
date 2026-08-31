@@ -31,10 +31,9 @@ uv run python -m ltx_pipelines_mlx.long_video \
   --prompt "A presenter speaks naturally to camera with subtle expressions and restrained hand gestures." \
   --segment-seconds 8 \
   --segment-handoff master \
-  --segment-preroll-frames 16 \
+  --segment-preroll-frames 8 \
   --transition hard \
   --preencode-audio \
-  --lighting-match \
   --quality fast \
   -H 1024 -W 576 \
   -o ten-minute-presenter.mp4
@@ -42,7 +41,7 @@ uv run python -m ltx_pipelines_mlx.long_video \
 
 At 24 fps, the default eight-second plan uses 193-frame shots. A ten-minute
 recording becomes about 75 independent generations. Later shots include a
-hidden 16-frame preroll. Each generated conditioning window is padded only
+hidden 8-frame preroll. Each generated conditioning window is padded only
 when required to reach an `8k + 1` frame count, then trimmed back to the exact
 source timeline before assembly.
 
@@ -84,8 +83,8 @@ long UGC and YouTube-style speech. It trades tiny pose changes at cuts for
 stable long-term sharpness: every segment starts from the same clean master
 frame rather than a progressively softer generated frame.
 
-`--segment-preroll-frames 16` begins conditioning roughly 0.67 seconds before
-each cut at 24 fps, then removes those 16 frames exactly. The visible segment
+`--segment-preroll-frames 8` begins conditioning roughly 0.33 seconds before
+each cut at 24 fps, then removes those 8 frames exactly. The visible segment
 therefore starts at the correct audio timestamp with speech already in motion,
 instead of repeatedly revealing the master frame's closed mouth.
 
@@ -115,7 +114,7 @@ passes when eyes and teeth matter; `fast` uses the quicker two-pass refine.
 
 ## Segment lighting match
 
-`--lighting-match` is enabled by default. It compares the first visible frame
+`--lighting-match` is optional and disabled by default. It compares the first visible frame
 of each generated segment with that segment's clean master frame. With a
 foreground mask it measures only the mask's black, stable background region;
 without one it samples conservative outer-border regions to avoid weighting
@@ -124,8 +123,9 @@ the presenter's face.
 One fixed, clamped exposure correction is then applied during the segment's
 existing H.264 encode. It performs no temporal filtering, interpolation, blur,
 or additional encode, so it does not reduce facial sharpness. The default
-`--lighting-match-max 0.08` prevents large corrections. Disable the experiment
-at any time with `--no-lighting-match`; the cache key changes automatically.
+`--lighting-match-max 0.08` prevents large corrections. Enable the experiment
+with `--lighting-match`; the cache key changes automatically. Leaving it disabled preserves
+the original per-segment pixels and avoids introducing a post-generation colour transform.
 
 ## One supplied-audio shot
 

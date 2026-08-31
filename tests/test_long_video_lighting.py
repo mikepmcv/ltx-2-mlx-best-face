@@ -4,9 +4,19 @@ import pytest
 from PIL import Image, ImageDraw
 
 from ltx_pipelines_mlx.long_video import (
+    _build_parser,
     _measure_brightness_correction,
     _stable_luma,
 )
+
+
+def test_master_jump_cut_defaults_preserve_generated_colour() -> None:
+    parser = _build_parser()
+    preroll = parser.get_default("segment_preroll_frames")
+    lighting_match = parser.get_default("lighting_match")
+
+    assert preroll == 8
+    assert lighting_match is False
 
 
 def _solid(path: Path, value: int) -> Path:

@@ -38,7 +38,6 @@ from .long_video_utils import (
     stable_config_hash,
 )
 
-
 SCENE_LOCK = (
     "The camera, background geometry, furniture, exposure, white balance, "
     "light direction, light intensity, and color temperature remain constant. "
@@ -549,8 +548,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--segment-preroll-frames",
         type=int,
-        default=16,
-        help="Generate and discard this many frames before master-frame segments after the first.",
+        default=8,
+        help=(
+            "Generate and discard this many frames before master-frame segments after the first "
+            "(default: 8, a short speech overlap without chaining generated frames)."
+        ),
     )
     parser.add_argument(
         "--low-memory",
@@ -566,8 +568,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lighting-match",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply one conservative background-derived exposure correction per segment (default).",
+        default=False,
+        help=(
+            "Apply a background-derived exposure correction per segment. Disabled by default so "
+            "the original generated pixels and colour response are preserved."
+        ),
     )
     parser.add_argument(
         "--lighting-match-max",
