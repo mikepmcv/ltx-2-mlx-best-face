@@ -219,6 +219,11 @@ class BestFacePipeline(DistilledPipeline):
             loras.append((_resolve_adapter_spec(path), float(strength)))
         self._pending_loras = loras
         self._spatial_upscaler_path = spatial_upscaler
+        # Long-video runs reuse the same identity at the same two resolutions.
+        # Keep the materialized reference tokens in memory so the VAE does not
+        # encode the character sheet twice for every segment.
+        self._identity_conditioning_cache: dict[tuple, tuple[mx.array, mx.array]] = {}
+        self._locked_audio_cache: dict[tuple, mx.array] = {}
 
     @staticmethod
     def _reference_size(
@@ -297,33 +302,52 @@ class BestFacePipeline(DistilledPipeline):
             reference_scale=reference_scale,
         )
 
-        # Best Face/BFS feeds the resized reference straight to the LTX VAE.
-        # Keep CRF=0 by default; nonzero is exposed only for experiments.
-        ref_pixels = load_image_and_preprocess(reference, ref_h, ref_w, crf=crf)
-        ref_pixels = ref_pixels[:, :, None, :, :]  # BCHW -> BCFHW
-        ref_latent = self.vae_encoder.encode(ref_pixels)
+        reference_path = Path(reference).expanduser().resolve()
+        stat = reference_path.stat()
+        cache_key = (
+            str(reference_path),
+            stat.st_size,
+            stat.st_mtime_ns,
+            ref_h,
+            ref_w,
+            float(position_scale_h),
+            float(position_scale_w),
+            float(frame_rate),
+            int(crf),
+        )
+        cached = self._identity_conditioning_cache.get(cache_key)
+        if cached is None:
+            # Best Face/BFS feeds the resized reference straight to the LTX VAE.
+            # Keep CRF=0 by default; nonzero is exposed only for experiments.
+            ref_pixels = load_image_and_preprocess(reference, ref_h, ref_w, crf=crf)
+            ref_pixels = ref_pixels[:, :, None, :, :]  # BCHW -> BCFHW
+            ref_latent = self.vae_encoder.encode(ref_pixels)
 
-        ref_f = int(ref_latent.shape[2])
-        ref_h_lat = int(ref_latent.shape[3])
-        ref_w_lat = int(ref_latent.shape[4])
-        ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(
-            ref_latent.shape[0], -1, ref_latent.shape[1]
-        )
-        ref_positions = compute_video_positions(
-            ref_f,
-            ref_h_lat,
-            ref_w_lat,
-            frame_rate=frame_rate,
-        )
-        ref_positions = mx.concatenate(
-            [
-                ref_positions[..., :1],
-                ref_positions[..., 1:2] * position_scale_h,
-                ref_positions[..., 2:3] * position_scale_w,
-            ],
-            axis=-1,
-        )
-        _materialize(ref_tokens, ref_positions)
+            ref_f = int(ref_latent.shape[2])
+            ref_h_lat = int(ref_latent.shape[3])
+            ref_w_lat = int(ref_latent.shape[4])
+            ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(
+                ref_latent.shape[0], -1, ref_latent.shape[1]
+            )
+            ref_positions = compute_video_positions(
+                ref_f,
+                ref_h_lat,
+                ref_w_lat,
+                frame_rate=frame_rate,
+            )
+            ref_positions = mx.concatenate(
+                [
+                    ref_positions[..., :1],
+                    ref_positions[..., 1:2] * position_scale_h,
+                    ref_positions[..., 2:3] * position_scale_w,
+                ],
+                axis=-1,
+            )
+            _materialize(ref_tokens, ref_positions)
+            cached = (ref_tokens, ref_positions)
+            if not self.low_memory:
+                self._identity_conditioning_cache[cache_key] = cached
+        ref_tokens, ref_positions = cached
 
         condition = VideoConditionByReferenceLatent(
             reference_latent=ref_tokens,
@@ -354,6 +378,21 @@ class BestFacePipeline(DistilledPipeline):
         read_duration = clip_duration if max_duration is None else min(max_duration, clip_duration)
         if read_duration <= 0:
             raise ValueError("audio_max_duration must be greater than zero")
+
+        audio_file = Path(audio_path).expanduser().resolve()
+        stat = audio_file.stat()
+        cache_key = (
+            str(audio_file),
+            stat.st_size,
+            stat.st_mtime_ns,
+            int(num_frames),
+            float(frame_rate),
+            float(start_time),
+            None if max_duration is None else float(max_duration),
+        )
+        cached = self._locked_audio_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         self._load_audio_encoder()
         assert self.audio_encoder is not None
@@ -389,11 +428,30 @@ class BestFacePipeline(DistilledPipeline):
                 f"expected {audio_t} tokens, got {audio_tokens.shape[1]}"
             )
         _materialize(audio_tokens)
+        self._locked_audio_cache[cache_key] = audio_tokens
 
         if self.low_memory:
             self.audio_conditioner.free()
             aggressive_cleanup()
         return audio_tokens
+
+    def preencode_locked_audio(
+        self,
+        audio_path: str,
+        *,
+        num_frames: int,
+        frame_rate: float,
+        start_time: float,
+        max_duration: float | None,
+    ) -> mx.array:
+        """Encode and cache one future long-video audio conditioning window."""
+        return self._encode_locked_audio_tokens(
+            audio_path,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            start_time=start_time,
+            max_duration=max_duration,
+        )
 
     def _prepare_original_audio(
         self,
@@ -535,6 +593,7 @@ class BestFacePipeline(DistilledPipeline):
         audio_path: str | None = None,
         audio_start_time: float = 0.0,
         audio_max_duration: float | None = None,
+        locked_audio_tokens: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Generate a Best Face video using LTX's fast distilled 8+3 flow."""
         if not prompt.lstrip().startswith("ref_t2v:"):
@@ -557,8 +616,9 @@ class BestFacePipeline(DistilledPipeline):
             ugc_ultrafast=ugc_ultrafast,
         )
 
-        locked_audio_tokens = None
-        if audio_path is not None:
+        if locked_audio_tokens is not None and audio_path is None:
+            raise ValueError("locked_audio_tokens requires audio_path for final muxing")
+        if locked_audio_tokens is None and audio_path is not None:
             with phase("Encoding locked TTS audio", verbose=self.verbose):
                 locked_audio_tokens = self._encode_locked_audio_tokens(
                     audio_path,
@@ -857,6 +917,7 @@ class BestFacePipeline(DistilledPipeline):
         audio_path: str | None = None,
         audio_start_time: float = 0.0,
         audio_max_duration: float | None = None,
+        locked_audio_tokens: mx.array | None = None,
     ) -> str:
         video_latent, audio_latent = self.generate_best_face(
             prompt=prompt,
@@ -888,6 +949,7 @@ class BestFacePipeline(DistilledPipeline):
             audio_path=audio_path,
             audio_start_time=audio_start_time,
             audio_max_duration=audio_max_duration,
+            locked_audio_tokens=locked_audio_tokens,
         )
         if audio_path is None:
             saved_path = self._decode_and_save_video(

@@ -464,6 +464,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reload large components per shot; slower but uses less RAM",
     )
+    parser.add_argument(
+        "--preencode-audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Encode and cache all segment TTS conditionings before the first generation (default).",
+    )
     parser.add_argument("--no-scene-lock-prompt", action="store_true")
     return parser
 
@@ -557,6 +563,8 @@ def main() -> None:
         "handoff_fade_frames": args.handoff_fade_frames,
         "transition": args.transition,
         "segment_preroll_frames": args.segment_preroll_frames,
+        "preencode_audio": args.preencode_audio,
+        "latent_upscale": "official_two_stage_spatial_upscaler",
         "mask_feather": args.mask_feather,
         "seed": args.seed,
         "plans": serialise_plan(plans),
@@ -575,6 +583,8 @@ def main() -> None:
         print("Background: pixel-locked outside the supplied foreground mask.")
 
     pipe: BestFacePipeline | None = None
+    preencoded_audio: dict[int, object] = {}
+    audio_preencoded = False
     visuals: list[Path] = []
     started = time.time()
 
@@ -654,6 +664,35 @@ def main() -> None:
                     extra_loras=extra_loras,
                     low_memory=args.low_memory,
                 )
+            if args.preencode_audio and not audio_preencoded:
+                print(f"Pre-encoding {len(plans)} audio conditioning windows ...")
+                for future_plan in plans:
+                    future_override = overrides.get(future_plan.index, {})
+                    future_uses_master_preroll = (
+                        future_plan.index > 0
+                        and (
+                            args.segment_handoff == "master"
+                            or future_override.get("first_frame") is not None
+                        )
+                    )
+                    future_window = build_conditioning_window(
+                        future_plan,
+                        frame_rate=args.frame_rate,
+                        preroll_frames=(
+                            args.segment_preroll_frames
+                            if future_uses_master_preroll
+                            else 0
+                        ),
+                    )
+                    preencoded_audio[future_plan.index] = pipe.preencode_locked_audio(
+                        str(audio),
+                        num_frames=future_window.num_frames,
+                        frame_rate=args.frame_rate,
+                        start_time=future_window.start_time,
+                        max_duration=future_window.source_duration,
+                    )
+                audio_preencoded = True
+                print("Audio conditioning cache ready.")
             print(
                 f"[{plan.index + 1}/{len(plans)}] generating "
                 f"{window.output_duration:.2f}s "
@@ -682,6 +721,7 @@ def main() -> None:
                 audio_path=str(chunk_audio),
                 audio_start_time=0.0,
                 audio_max_duration=window.output_duration,
+                locked_audio_tokens=preencoded_audio.get(plan.index),
             )
         else:
             print(f"[{plan.index + 1}/{len(plans)}] resuming existing shot")
@@ -751,6 +791,9 @@ def main() -> None:
         "segment_handoff": args.segment_handoff,
         "transition": args.transition,
         "segment_preroll_frames": args.segment_preroll_frames,
+        "preencode_audio": args.preencode_audio,
+        "model_residency": "low_memory_reload" if args.low_memory else "warm_across_segments",
+        "latent_upscale": "official_two_stage_spatial_upscaler",
     }
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",

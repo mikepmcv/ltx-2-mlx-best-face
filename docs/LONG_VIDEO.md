@@ -33,6 +33,7 @@ uv run python -m ltx_pipelines_mlx.long_video \
   --segment-handoff master \
   --segment-preroll-frames 16 \
   --transition hard \
+  --preencode-audio \
   --quality fast \
   -H 1024 -W 576 \
   -o ten-minute-presenter.mp4
@@ -90,6 +91,26 @@ instead of repeatedly revealing the master frame's closed mouth.
 For the older continuous-handoff behavior, use `--segment-handoff previous`.
 Add `--transition fade` if a short visual blend is preferred, although that
 mode can accumulate softness over a long video.
+
+## Warm generation and latent upscaling
+
+The normal long-video mode keeps the transformer, VAE encoder, official LTX
+spatial latent upscaler, decoders, and reusable conditioning in one pipeline
+instance across segments. Do not add `--low-memory` on a 128 GB machine: that
+flag deliberately unloads large components between shots and is slower.
+
+`--preencode-audio` is enabled by default. Before the first missing segment is
+generated, all TTS conditioning windows are encoded and retained in memory.
+The character sheet is also VAE-encoded only once at each required stage
+resolution and reused across the run. Both caches are in-memory performance
+optimizations; the existing content-addressed WAV/video cache remains the
+restart mechanism.
+
+Best Face is already a two-stage latent-upscale workflow: Stage 1 generates at
+half resolution, the official LTX spatial upscaler enlarges the latent, and
+Stage 2 refines it at output resolution. There is therefore no separate final
+MP4 latent-upscale switch. Use `--quality balanced` for three Stage 2 detail
+passes when eyes and teeth matter; `fast` uses the quicker two-pass refine.
 
 ## One supplied-audio shot
 
