@@ -112,6 +112,29 @@ Stage 2 refines it at output resolution. There is therefore no separate final
 MP4 latent-upscale switch. Use `--quality balanced` for three Stage 2 detail
 passes when eyes and teeth matter; `fast` uses the quicker two-pass refine.
 
+## Separate 1080p delivery upscale
+
+After generation, use the independent delivery upscaler to create a clean
+1080p upload without changing the generator, timing, frame rate, or audio:
+
+```bash
+uv run python -m ltx_pipelines_mlx.upscale_video \
+  --input sample/long-video-768x1344-balanced-stable.mp4 \
+  --output sample/long-video-1080x1920.mp4 \
+  --width 1080 \
+  --height 1920 \
+  --fit crop \
+  --sharpen 0.20 \
+  --crf 16 \
+  --preset slow
+```
+
+This performs one temporally stable Lanczos resize and a mild luma-only
+sharpen. It does not interpolate frames, regenerate faces, invent eye or tooth
+detail, or re-encode the original audio. `--fit crop` fills exact 9:16 and
+center-crops the small aspect mismatch in a 768x1344 source. Use `--fit pad` to
+preserve the complete frame instead, or `--sharpen 0` for resize-only output.
+
 ## Segment lighting match
 
 `--lighting-match` is optional and disabled by default. It compares the first visible frame
