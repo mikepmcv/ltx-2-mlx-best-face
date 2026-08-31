@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,8 +33,11 @@ from PIL import Image, ImageEnhance, ImageFilter
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape, snap_output_dimensions
 from ltx_core_mlx.conditioning.source_phase import SourcePhaseBlock, clear_source_phase, install_source_phase
 from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
+from ltx_core_mlx.conditioning.types.latent_cond import LatentState
 from ltx_core_mlx.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
+from ltx_core_mlx.model.audio_vae import encode_audio
 from ltx_core_mlx.model.transformer.model import X0Model
+from ltx_core_mlx.utils.audio import load_audio
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 
@@ -215,6 +219,11 @@ class BestFacePipeline(DistilledPipeline):
             loras.append((_resolve_adapter_spec(path), float(strength)))
         self._pending_loras = loras
         self._spatial_upscaler_path = spatial_upscaler
+        # Long-video runs reuse the same identity at the same two resolutions.
+        # Keep the materialized reference tokens in memory so the VAE does not
+        # encode the character sheet twice for every segment.
+        self._identity_conditioning_cache: dict[tuple, tuple[mx.array, mx.array]] = {}
+        self._locked_audio_cache: dict[tuple, mx.array] = {}
 
     @staticmethod
     def _reference_size(
@@ -293,33 +302,52 @@ class BestFacePipeline(DistilledPipeline):
             reference_scale=reference_scale,
         )
 
-        # Best Face/BFS feeds the resized reference straight to the LTX VAE.
-        # Keep CRF=0 by default; nonzero is exposed only for experiments.
-        ref_pixels = load_image_and_preprocess(reference, ref_h, ref_w, crf=crf)
-        ref_pixels = ref_pixels[:, :, None, :, :]  # BCHW -> BCFHW
-        ref_latent = self.vae_encoder.encode(ref_pixels)
+        reference_path = Path(reference).expanduser().resolve()
+        stat = reference_path.stat()
+        cache_key = (
+            str(reference_path),
+            stat.st_size,
+            stat.st_mtime_ns,
+            ref_h,
+            ref_w,
+            float(position_scale_h),
+            float(position_scale_w),
+            float(frame_rate),
+            int(crf),
+        )
+        cached = self._identity_conditioning_cache.get(cache_key)
+        if cached is None:
+            # Best Face/BFS feeds the resized reference straight to the LTX VAE.
+            # Keep CRF=0 by default; nonzero is exposed only for experiments.
+            ref_pixels = load_image_and_preprocess(reference, ref_h, ref_w, crf=crf)
+            ref_pixels = ref_pixels[:, :, None, :, :]  # BCHW -> BCFHW
+            ref_latent = self.vae_encoder.encode(ref_pixels)
 
-        ref_f = int(ref_latent.shape[2])
-        ref_h_lat = int(ref_latent.shape[3])
-        ref_w_lat = int(ref_latent.shape[4])
-        ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(
-            ref_latent.shape[0], -1, ref_latent.shape[1]
-        )
-        ref_positions = compute_video_positions(
-            ref_f,
-            ref_h_lat,
-            ref_w_lat,
-            frame_rate=frame_rate,
-        )
-        ref_positions = mx.concatenate(
-            [
-                ref_positions[..., :1],
-                ref_positions[..., 1:2] * position_scale_h,
-                ref_positions[..., 2:3] * position_scale_w,
-            ],
-            axis=-1,
-        )
-        _materialize(ref_tokens, ref_positions)
+            ref_f = int(ref_latent.shape[2])
+            ref_h_lat = int(ref_latent.shape[3])
+            ref_w_lat = int(ref_latent.shape[4])
+            ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(
+                ref_latent.shape[0], -1, ref_latent.shape[1]
+            )
+            ref_positions = compute_video_positions(
+                ref_f,
+                ref_h_lat,
+                ref_w_lat,
+                frame_rate=frame_rate,
+            )
+            ref_positions = mx.concatenate(
+                [
+                    ref_positions[..., :1],
+                    ref_positions[..., 1:2] * position_scale_h,
+                    ref_positions[..., 2:3] * position_scale_w,
+                ],
+                axis=-1,
+            )
+            _materialize(ref_tokens, ref_positions)
+            cached = (ref_tokens, ref_positions)
+            if not self.low_memory:
+                self._identity_conditioning_cache[cache_key] = cached
+        ref_tokens, ref_positions = cached
 
         condition = VideoConditionByReferenceLatent(
             reference_latent=ref_tokens,
@@ -333,6 +361,130 @@ class BestFacePipeline(DistilledPipeline):
             segment_value=float(source_id) * float(phase_scale),
         )
         return condition, block
+
+    def _encode_locked_audio_tokens(
+        self,
+        audio_path: str,
+        *,
+        num_frames: int,
+        frame_rate: float,
+        start_time: float,
+        max_duration: float | None,
+    ) -> mx.array:
+        """Encode supplied speech and return clean audio tokens for joint AV denoising."""
+        if frame_rate <= 0:
+            raise ValueError("frame_rate must be greater than zero")
+        clip_duration = num_frames / frame_rate
+        read_duration = clip_duration if max_duration is None else min(max_duration, clip_duration)
+        if read_duration <= 0:
+            raise ValueError("audio_max_duration must be greater than zero")
+
+        audio_file = Path(audio_path).expanduser().resolve()
+        stat = audio_file.stat()
+        cache_key = (
+            str(audio_file),
+            stat.st_size,
+            stat.st_mtime_ns,
+            int(num_frames),
+            float(frame_rate),
+            float(start_time),
+            None if max_duration is None else float(max_duration),
+        )
+        cached = self._locked_audio_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        self._load_audio_encoder()
+        assert self.audio_encoder is not None
+        assert self.audio_processor is not None
+
+        audio_data = load_audio(
+            audio_path,
+            target_sample_rate=16000,
+            start_time=start_time,
+            max_duration=read_duration,
+        )
+        if audio_data is None:
+            raise ValueError(f"No audio found in {audio_path}")
+
+        target_samples = max(1, round(clip_duration * audio_data.sample_rate))
+        waveform = audio_data.waveform[:, :, :target_samples]
+        missing_samples = target_samples - int(waveform.shape[-1])
+        if missing_samples > 0:
+            waveform = mx.pad(waveform, ((0, 0), (0, 0), (0, missing_samples)))
+
+        audio_latent = encode_audio(
+            waveform,
+            audio_data.sample_rate,
+            self.audio_encoder,
+            self.audio_processor,
+        )
+        audio_t = compute_audio_token_count(num_frames, frame_rate=frame_rate)
+        audio_latent = audio_latent[:, :, :audio_t, :]
+        audio_tokens, _ = self.audio_patchifier.patchify(audio_latent)
+        if int(audio_tokens.shape[1]) != audio_t:
+            raise ValueError(
+                "Encoded audio length does not match the requested video: "
+                f"expected {audio_t} tokens, got {audio_tokens.shape[1]}"
+            )
+        _materialize(audio_tokens)
+        self._locked_audio_cache[cache_key] = audio_tokens
+
+        if self.low_memory:
+            self.audio_conditioner.free()
+            aggressive_cleanup()
+        return audio_tokens
+
+    def preencode_locked_audio(
+        self,
+        audio_path: str,
+        *,
+        num_frames: int,
+        frame_rate: float,
+        start_time: float,
+        max_duration: float | None,
+    ) -> mx.array:
+        """Encode and cache one future long-video audio conditioning window."""
+        return self._encode_locked_audio_tokens(
+            audio_path,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            start_time=start_time,
+            max_duration=max_duration,
+        )
+
+    def _prepare_original_audio(
+        self,
+        audio_path: str,
+        *,
+        num_frames: int,
+        frame_rate: float,
+        start_time: float,
+        max_duration: float | None,
+    ) -> str:
+        """Create an exact-duration PCM copy of the supplied audio for final muxing."""
+        clip_duration = num_frames / frame_rate
+        read_duration = clip_duration if max_duration is None else min(max_duration, clip_duration)
+        audio_data = load_audio(
+            audio_path,
+            target_sample_rate=48000,
+            start_time=start_time,
+            max_duration=read_duration,
+        )
+        if audio_data is None:
+            raise ValueError(f"No audio found in {audio_path}")
+
+        target_samples = max(1, round(clip_duration * audio_data.sample_rate))
+        waveform = audio_data.waveform[:, :, :target_samples]
+        missing_samples = target_samples - int(waveform.shape[-1])
+        if missing_samples > 0:
+            waveform = mx.pad(waveform, ((0, 0), (0, 0), (0, missing_samples)))
+        _materialize(waveform)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+            temp_path = temp.name
+        self._save_waveform(waveform, temp_path, sample_rate=audio_data.sample_rate)
+        return temp_path
 
     def _encode_keyframe(
         self,
@@ -438,6 +590,10 @@ class BestFacePipeline(DistilledPipeline):
         first_frame_mode: str = "appearance",
         last_frame_mode: str = "appearance",
         keyframe_layout_blur: float = 32.0,
+        audio_path: str | None = None,
+        audio_start_time: float = 0.0,
+        audio_max_duration: float | None = None,
+        locked_audio_tokens: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Generate a Best Face video using LTX's fast distilled 8+3 flow."""
         if not prompt.lstrip().startswith("ref_t2v:"):
@@ -459,6 +615,18 @@ class BestFacePipeline(DistilledPipeline):
             ugc_fast=ugc_fast,
             ugc_ultrafast=ugc_ultrafast,
         )
+
+        if locked_audio_tokens is not None and audio_path is None:
+            raise ValueError("locked_audio_tokens requires audio_path for final muxing")
+        if locked_audio_tokens is None and audio_path is not None:
+            with phase("Encoding locked TTS audio", verbose=self.verbose):
+                locked_audio_tokens = self._encode_locked_audio_tokens(
+                    audio_path,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    start_time=audio_start_time,
+                    max_duration=audio_max_duration,
+                )
 
         # The official character-sheet refine pass uses CFG++ at CFG 1. Its
         # unconditional prediction still controls the sampler direction.
@@ -545,16 +713,28 @@ class BestFacePipeline(DistilledPipeline):
             initial_latent=None,
             legacy_scalar_blend=True,
         )
-        audio_state_1 = create_noised_state(
-            base_shape=audio_shape,
-            conditionings=[],
-            spatial_dims=(F, H_half, W_half),
-            positions=audio_positions,
-            seed=seed + 1,
-            sigma=1.0,
-            initial_latent=None,
-            legacy_scalar_blend=True,
-        )
+        if locked_audio_tokens is None:
+            audio_state_1 = create_noised_state(
+                base_shape=audio_shape,
+                conditionings=[],
+                spatial_dims=(F, H_half, W_half),
+                positions=audio_positions,
+                seed=seed + 1,
+                sigma=1.0,
+                initial_latent=None,
+                legacy_scalar_blend=True,
+            )
+        else:
+            # A zero denoise mask freezes the supplied TTS latent. The video
+            # still attends to it, so facial motion follows the recording.
+            audio_state_1 = LatentState(
+                latent=locked_audio_tokens,
+                clean_latent=locked_audio_tokens,
+                denoise_mask=mx.zeros(
+                    (1, locked_audio_tokens.shape[1], 1), dtype=mx.bfloat16
+                ),
+                positions=audio_positions,
+            )
 
         sigmas_1 = _sigma_schedule_for_steps(DISTILLED_SIGMAS, stage1_steps)
         x0_model = X0Model(self.dit)
@@ -650,15 +830,26 @@ class BestFacePipeline(DistilledPipeline):
         )
 
         audio_tokens_1 = output_1.audio_latent
-        audio_state_2 = create_noised_state(
-            base_shape=audio_tokens_1.shape,
-            conditionings=[],
-            spatial_dims=(F, H_full, W_full),
-            positions=audio_positions,
-            seed=seed + 2,
-            sigma=start_sigma,
-            initial_latent=audio_tokens_1,
-        )
+        if locked_audio_tokens is None:
+            audio_state_2 = create_noised_state(
+                base_shape=audio_tokens_1.shape,
+                conditionings=[],
+                spatial_dims=(F, H_full, W_full),
+                positions=audio_positions,
+                seed=seed + 2,
+                sigma=start_sigma,
+                initial_latent=audio_tokens_1,
+            )
+        else:
+            # Keep the original TTS latent frozen through refinement too.
+            audio_state_2 = LatentState(
+                latent=locked_audio_tokens,
+                clean_latent=locked_audio_tokens,
+                denoise_mask=mx.zeros(
+                    (1, locked_audio_tokens.shape[1], 1), dtype=mx.bfloat16
+                ),
+                positions=audio_positions,
+            )
 
         install_source_phase(self.dit, [phase_2], theta=float(self.dit.config.rope_theta))
         self._pre_denoise_flush(video_state_2, audio_state_2)
@@ -723,6 +914,10 @@ class BestFacePipeline(DistilledPipeline):
         first_frame_mode: str = "appearance",
         last_frame_mode: str = "appearance",
         keyframe_layout_blur: float = 32.0,
+        audio_path: str | None = None,
+        audio_start_time: float = 0.0,
+        audio_max_duration: float | None = None,
+        locked_audio_tokens: mx.array | None = None,
     ) -> str:
         video_latent, audio_latent = self.generate_best_face(
             prompt=prompt,
@@ -751,13 +946,45 @@ class BestFacePipeline(DistilledPipeline):
             first_frame_mode=first_frame_mode,
             last_frame_mode=last_frame_mode,
             keyframe_layout_blur=keyframe_layout_blur,
+            audio_path=audio_path,
+            audio_start_time=audio_start_time,
+            audio_max_duration=audio_max_duration,
+            locked_audio_tokens=locked_audio_tokens,
         )
-        saved_path = self._decode_and_save_video(
-            video_latent,
-            audio_latent,
-            output_path,
-            frame_rate=frame_rate,
-        )
+        if audio_path is None:
+            saved_path = self._decode_and_save_video(
+                video_latent,
+                audio_latent,
+                output_path,
+                frame_rate=frame_rate,
+            )
+        else:
+            # Decode video with an exact-duration PCM copy of the input. The
+            # model's audio output is deliberately discarded, guaranteeing
+            # that generated speech, ambience, or music cannot reach the file.
+            if self.low_memory and self.dit is not None:
+                self.dit = None
+                self._loaded = False
+                aggressive_cleanup()
+            self._load_decoders()
+            original_audio = self._prepare_original_audio(
+                audio_path,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                start_time=audio_start_time,
+                max_duration=audio_max_duration,
+            )
+            try:
+                with phase("Decoding video + muxing original TTS", verbose=self.verbose):
+                    self.video_decoder_block.decode_and_stream(
+                        video_latent,
+                        output_path,
+                        frame_rate=frame_rate,
+                        audio_path=original_audio,
+                    )
+                saved_path = output_path
+            finally:
+                Path(original_audio).unlink(missing_ok=True)
         effective_height, effective_width = snap_output_dimensions(height, width, two_stage=True)
         (
             effective_stage1_steps,
@@ -797,6 +1024,12 @@ class BestFacePipeline(DistilledPipeline):
                 "first_frame_mode": first_frame_mode,
                 "last_frame_mode": last_frame_mode,
                 "keyframe_layout_blur": keyframe_layout_blur,
+                "audio_path": (
+                    str(Path(audio_path).expanduser().resolve()) if audio_path else None
+                ),
+                "audio_start_time": audio_start_time if audio_path else None,
+                "audio_max_duration": audio_max_duration if audio_path else None,
+                "audio_mode": "locked_input" if audio_path else "generated",
                 "height": effective_height,
                 "width": effective_width,
                 "num_frames": num_frames,
@@ -950,6 +1183,18 @@ def main() -> None:
         default="appearance",
     )
     parser.add_argument("--keyframe-layout-blur", type=float, default=32.0)
+    parser.add_argument(
+        "--audio",
+        default=None,
+        help="Optional TTS/audio file. Its latent is frozen for lip-sync and its original PCM is muxed.",
+    )
+    parser.add_argument("--audio-start", type=float, default=0.0)
+    parser.add_argument(
+        "--audio-max-duration",
+        type=float,
+        default=None,
+        help="Read at most this many seconds, then pad silence to the video duration.",
+    )
 
     args = parser.parse_args()
     if args.seed < 0:
@@ -1011,6 +1256,8 @@ def main() -> None:
         print(f"  first frame: {args.first_frame} (strength {args.first_frame_strength:g})")
     if args.last_frame:
         print(f"  last frame: {args.last_frame} (strength {args.last_frame_strength:g})")
+    if args.audio:
+        print(f"  locked TTS audio: {args.audio} (start {args.audio_start:g}s)")
 
     pipe.generate_and_save_best_face(
         prompt=args.prompt,
@@ -1040,6 +1287,9 @@ def main() -> None:
         first_frame_mode=args.first_frame_mode,
         last_frame_mode=args.last_frame_mode,
         keyframe_layout_blur=args.keyframe_layout_blur,
+        audio_path=args.audio,
+        audio_start_time=args.audio_start,
+        audio_max_duration=args.audio_max_duration,
     )
     print(f"Saved {Path(args.output)} in {time.time() - t0:.1f}s")
 

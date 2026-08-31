@@ -1,0 +1,941 @@
+"""Resumable Best Face + locked-TTS orchestration for long talking videos.
+
+The model still renders short shots. This module keeps identity and scene
+conditioning fresh on every shot, strips every generated audio stream, and
+muxes the original continuous TTS recording into the final video.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import shutil
+import subprocess
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+from PIL import Image
+
+from ltx_core_mlx.components.patchifiers import snap_output_dimensions
+from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
+
+from .best_face import (
+    DEFAULT_GEMMA,
+    DEFAULT_MODEL,
+    OFFICIAL_BASE_FACE_STRENGTH,
+    OFFICIAL_SPATIAL_UPSCALER_FILE,
+    BestFacePipeline,
+    _default_best_face_spec,
+)
+from .long_video_utils import (
+    SegmentPlan,
+    build_conditioning_window,
+    build_segment_plan,
+    concat_file_line,
+    serialise_plan,
+    stable_config_hash,
+)
+
+
+SCENE_LOCK = (
+    "The camera, background geometry, furniture, exposure, white balance, "
+    "light direction, light intensity, and color temperature remain constant. "
+    "No camera drift, zoom, exposure breathing, relighting, time-of-day change, "
+    "moving furniture, or morphing background."
+)
+
+
+def _run(command: list[str], *, label: str) -> None:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"{label} failed:\n{detail[-4000:]}")
+
+
+def _find_ffprobe() -> str:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        raise RuntimeError("ffprobe is required alongside ffmpeg")
+    return ffprobe
+
+
+def _probe_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            _find_ffprobe(),
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not read audio duration: {result.stderr.strip()}")
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("ffprobe returned an invalid audio duration") from exc
+    if duration <= 0:
+        raise RuntimeError("Input audio is empty")
+    return duration
+
+
+def _extract_padded_pcm(
+    *,
+    source: Path,
+    plan: SegmentPlan,
+    destination: Path,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-ss",
+            f"{plan.start_time:.9f}",
+            "-t",
+            f"{plan.source_duration:.9f}",
+            "-i",
+            str(source),
+            "-af",
+            f"apad=pad_dur={plan.output_duration:.9f},atrim=0:{plan.output_duration:.9f}",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+            str(destination),
+        ],
+        label=f"extracting audio segment {plan.index}",
+    )
+
+
+def _normalise_video(
+    source: Path,
+    destination: Path,
+    *,
+    frame_rate: float,
+    duration: float,
+    trim_start_frames: int = 0,
+    brightness_correction: float = 0.0,
+) -> None:
+    filters = []
+    if trim_start_frames > 0:
+        filters.append(f"trim=start_frame={trim_start_frames}")
+        filters.append("setpts=PTS-STARTPTS")
+    if abs(brightness_correction) > 1e-6:
+        filters.append(f"eq=brightness={brightness_correction:.8f}:eval=init")
+    command = [
+        find_ffmpeg(),
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    if filters:
+        command.extend(["-vf", ",".join(filters)])
+    command.extend(
+        [
+            "-r",
+            f"{frame_rate:g}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-t",
+            f"{duration:.9f}",
+            str(destination),
+        ]
+    )
+    _run(
+        command,
+        label="stripping model audio",
+    )
+
+
+def _extract_analysis_frame(
+    source: Path,
+    destination: Path,
+    *,
+    frame_index: int,
+) -> None:
+    """Extract the first visible frame used for per-segment light matching."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            f"select=eq(n\\,{frame_index})",
+            "-frames:v",
+            "1",
+            str(destination),
+        ],
+        label="sampling segment lighting",
+    )
+
+
+def _stable_luma(
+    image_path: Path,
+    *,
+    foreground_mask: Path | None,
+) -> float:
+    """Measure background/border luminance without weighting the central face."""
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+        analysis_width = min(256, image.width)
+        analysis_height = max(1, round(image.height * analysis_width / image.width))
+        image = image.resize((analysis_width, analysis_height), Image.Resampling.BILINEAR)
+    mask = None
+    if foreground_mask is not None:
+        with Image.open(foreground_mask) as source_mask:
+            mask = source_mask.convert("L").resize(
+                image.size,
+                Image.Resampling.BILINEAR,
+            )
+
+    pixels = image.load()
+    mask_pixels = mask.load() if mask is not None else None
+    width, height = image.size
+    side = max(1, width // 8)
+    top = max(1, height // 10)
+    total = 0.0
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            if mask_pixels is not None:
+                use_pixel = mask_pixels[x, y] <= 64
+            else:
+                use_pixel = x < side or x >= width - side or y < top
+            if not use_pixel:
+                continue
+            red, green, blue = pixels[x, y]
+            total += 0.2126 * red + 0.7152 * green + 0.0722 * blue
+            count += 1
+    if count < 64:
+        raise ValueError("lighting-match region contains too few background pixels")
+    return total / count
+
+
+def _measure_brightness_correction(
+    *,
+    master_frame: Path,
+    generated_frame: Path,
+    foreground_mask: Path | None,
+    maximum: float,
+) -> float:
+    """Return a conservative fixed FFmpeg ``eq`` brightness correction."""
+    if maximum < 0:
+        raise ValueError("lighting-match-max must be zero or greater")
+    target = _stable_luma(master_frame, foreground_mask=foreground_mask)
+    actual = _stable_luma(generated_frame, foreground_mask=foreground_mask)
+    correction = (target - actual) / 255.0
+    return max(-maximum, min(maximum, correction))
+
+
+def _extract_last_frame(source: Path, destination: Path) -> None:
+    """Extract a lossless handoff frame from a completed visual segment."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-sseof",
+            "-1",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-vf",
+            "reverse",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "png",
+            str(destination),
+        ],
+        label="extracting the segment handoff frame",
+    )
+
+
+def _soften_segment_start(
+    *,
+    generated: Path,
+    handoff_frame: Path,
+    destination: Path,
+    width: int,
+    height: int,
+    frame_rate: float,
+    duration: float,
+    fade_frames: int,
+) -> None:
+    """Blend a handoff still over the first few frames to hide relighting."""
+    if fade_frames <= 0:
+        shutil.copy2(generated, destination)
+        return
+    fade_duration = fade_frames / frame_rate
+    graph = (
+        f"[1:v]scale={width}:{height},format=rgba,"
+        f"fade=t=out:st=0:d={fade_duration:.9f}:alpha=1[handoff];"
+        "[0:v][handoff]overlay=shortest=1,format=yuv420p[outv]"
+    )
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-i",
+            str(generated),
+            "-loop",
+            "1",
+            "-i",
+            str(handoff_frame),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[outv]",
+            "-an",
+            "-r",
+            f"{frame_rate:g}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-t",
+            f"{duration:.9f}",
+            str(destination),
+        ],
+        label="softening the segment handoff",
+    )
+
+
+def _lock_background(
+    *,
+    generated: Path,
+    background: Path,
+    foreground_mask: Path,
+    destination: Path,
+    width: int,
+    height: int,
+    frame_rate: float,
+    duration: float,
+    mask_feather: float,
+    trim_start_frames: int = 0,
+    brightness_correction: float = 0.0,
+) -> None:
+    blur = f",gblur=sigma={mask_feather:g}" if mask_feather > 0 else ""
+    trim = (
+        f"trim=start_frame={trim_start_frames},setpts=PTS-STARTPTS,"
+        if trim_start_frames > 0
+        else ""
+    )
+    correction = (
+        f"eq=brightness={brightness_correction:.8f}:eval=init,"
+        if abs(brightness_correction) > 1e-6
+        else ""
+    )
+    graph = (
+        f"[0:v]{trim}{correction}format=yuv420p[generated];"
+        f"[1:v]scale={width}:{height},format=yuv420p[bg];"
+        f"[2:v]scale={width}:{height},format=gray{blur}[mask];"
+        "[bg][generated][mask]maskedmerge,format=yuv420p[outv]"
+    )
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-i",
+            str(generated),
+            "-loop",
+            "1",
+            "-i",
+            str(background),
+            "-loop",
+            "1",
+            "-i",
+            str(foreground_mask),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[outv]",
+            "-an",
+            "-r",
+            f"{frame_rate:g}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-t",
+            f"{duration:.9f}",
+            str(destination),
+        ],
+        label="locking the background",
+    )
+
+
+def _write_concat_list(paths: list[Path], destination: Path) -> None:
+    destination.write_text(
+        "\n".join(concat_file_line(path) for path in paths) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _assemble(
+    *,
+    visual_segments: list[Path],
+    original_audio: Path,
+    work_dir: Path,
+    output: Path,
+) -> None:
+    video_list = work_dir / "video-concat.txt"
+    silent_video = work_dir / "assembled-video.mp4"
+    _write_concat_list(visual_segments, video_list)
+
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(video_list),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "copy",
+            str(silent_video),
+        ],
+        label="concatenating video segments",
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            find_ffmpeg(),
+            "-y",
+            "-i",
+            str(silent_video),
+            "-i",
+            str(original_audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ],
+        label="muxing the original continuous TTS track",
+    )
+
+
+def _load_overrides(path: Path | None) -> dict[int, dict]:
+    if path is None:
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("segments", [])
+    else:
+        rows = []
+    if not isinstance(rows, list):
+        raise ValueError("Shot manifest must be a list or contain a segments list")
+    overrides: dict[int, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or "index" not in row:
+            raise ValueError("Each shot override requires an integer index")
+        index = int(row["index"])
+        if index in overrides:
+            raise ValueError(f"Duplicate shot override index {index}")
+        overrides[index] = row
+    return overrides
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m ltx_pipelines_mlx.long_video",
+        description="Create resumable long Best Face videos from a supplied TTS recording.",
+    )
+    parser.add_argument("--audio", required=True, help="Complete TTS/narration audio")
+    parser.add_argument("--reference", required=True, help="Best Face identity reference")
+    parser.add_argument("--first-frame", required=True, help="Master presenter + scene frame")
+    parser.add_argument("--prompt", required=True, help="Presenter/action prompt")
+    parser.add_argument("--output", "-o", required=True)
+    parser.add_argument("--foreground-mask", default=None, help="White=generated presenter; black=locked scene")
+    parser.add_argument("--mask-feather", type=float, default=6.0)
+    parser.add_argument("--shot-manifest", default=None, help="Optional JSON per-segment prompt/frame/mask overrides")
+    parser.add_argument("--segment-seconds", type=float, default=8.0)
+    parser.add_argument("--limit-seconds", type=float, default=None)
+    parser.add_argument("--work-dir", default=None)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--gemma", default=DEFAULT_GEMMA)
+    parser.add_argument("--best-face-lora", default=None)
+    parser.add_argument("--best-face-strength", type=float, default=1.0)
+    parser.add_argument("--base-face-lora", default=None)
+    parser.add_argument("--base-face-strength", type=float, default=OFFICIAL_BASE_FACE_STRENGTH)
+    parser.add_argument("--spatial-upscaler", default=None)
+    parser.add_argument("--extra-lora", action="append", nargs=2, default=[], metavar=("PATH", "STRENGTH"))
+    parser.add_argument("--character-sheet", action="store_true")
+    parser.add_argument("--height", "-H", type=int, default=1024)
+    parser.add_argument("--width", "-W", type=int, default=576)
+    parser.add_argument("--frame-rate", type=float, default=24.0)
+    parser.add_argument("--seed", type=int, default=-1)
+    parser.add_argument(
+        "--quality",
+        choices=["standard", "balanced", "fast", "ultrafast"],
+        default="fast",
+        help=(
+            "balanced uses 7+3 denoising steps for better eyes/teeth at a "
+            "smaller cost than the full standard preset"
+        ),
+    )
+    parser.add_argument("--reference-scale", type=float, default=1.0)
+    parser.add_argument("--first-frame-strength", type=float, default=1.0)
+    parser.add_argument("--keyframe-layout-blur", type=float, default=32.0)
+    parser.add_argument(
+        "--segment-handoff",
+        choices=["previous", "master"],
+        default="master",
+        help=(
+            "Restart every segment from --first-frame (default), or use the "
+            "preceding generated end frame with 'previous'."
+        ),
+    )
+    parser.add_argument(
+        "--handoff-fade-frames",
+        type=int,
+        default=3,
+        help="For --transition fade, blend this many opening frames.",
+    )
+    parser.add_argument(
+        "--transition",
+        choices=["hard", "fade"],
+        default="hard",
+        help="Use direct creator-style cuts by default; fade applies only to previous-frame handoffs.",
+    )
+    parser.add_argument(
+        "--segment-preroll-frames",
+        type=int,
+        default=16,
+        help="Generate and discard this many frames before master-frame segments after the first.",
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Reload large components per shot; slower but uses less RAM",
+    )
+    parser.add_argument(
+        "--preencode-audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Encode and cache all segment TTS conditionings before the first generation (default).",
+    )
+    parser.add_argument(
+        "--lighting-match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply one conservative background-derived exposure correction per segment (default).",
+    )
+    parser.add_argument(
+        "--lighting-match-max",
+        type=float,
+        default=0.08,
+        help="Maximum absolute FFmpeg brightness correction per segment (default: 0.08).",
+    )
+    parser.add_argument("--no-scene-lock-prompt", action="store_true")
+    return parser
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    audio = Path(args.audio).expanduser().resolve()
+    reference = Path(args.reference).expanduser().resolve()
+    first_frame = Path(args.first_frame).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    foreground_mask = Path(args.foreground_mask).expanduser().resolve() if args.foreground_mask else None
+    shot_manifest = Path(args.shot_manifest).expanduser().resolve() if args.shot_manifest else None
+
+    for label, path in (("audio", audio), ("reference", reference), ("first frame", first_frame)):
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} does not exist: {path}")
+    if foreground_mask is not None and not foreground_mask.is_file():
+        raise FileNotFoundError(f"foreground mask does not exist: {foreground_mask}")
+    if args.handoff_fade_frames < 0:
+        raise ValueError("handoff-fade-frames must be zero or greater")
+    if args.segment_preroll_frames < 0:
+        raise ValueError("segment-preroll-frames must be zero or greater")
+    if args.lighting_match_max < 0:
+        raise ValueError("lighting-match-max must be zero or greater")
+
+    duration = _probe_duration(audio)
+    if args.limit_seconds is not None:
+        if args.limit_seconds <= 0:
+            raise ValueError("limit-seconds must be greater than zero")
+        duration = min(duration, args.limit_seconds)
+    args.height, args.width = snap_output_dimensions(
+        args.height,
+        args.width,
+        two_stage=True,
+    )
+    plans = build_segment_plan(
+        duration,
+        max_segment_seconds=args.segment_seconds,
+        frame_rate=args.frame_rate,
+    )
+    overrides = _load_overrides(shot_manifest)
+
+    work_dir = (
+        Path(args.work_dir).expanduser().resolve()
+        if args.work_dir
+        else output.with_suffix(output.suffix + ".work")
+    )
+    audio_dir = work_dir / "audio"
+    raw_dir = work_dir / "raw"
+    visual_dir = work_dir / "visual"
+    handoff_dir = work_dir / "handoff"
+    for directory in (audio_dir, raw_dir, visual_dir, handoff_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    if args.seed < 0:
+        args.seed = random.randint(0, 2**31 - len(plans) - 1)
+
+    lora_spec = args.best_face_lora or _default_best_face_spec(args.character_sheet)
+    base_face_lora = args.base_face_lora
+    if args.character_sheet and base_face_lora is None:
+        base_face_lora = _default_best_face_spec(False)
+    spatial_upscaler = args.spatial_upscaler
+    if args.character_sheet and spatial_upscaler is None:
+        spatial_upscaler = OFFICIAL_SPATIAL_UPSCALER_FILE
+    resize_mode = "native_resolution" if args.character_sheet else "match_target"
+    extra_loras = [(path, float(strength)) for path, strength in args.extra_lora]
+
+    def fingerprint(path: Path | None) -> dict | None:
+        if path is None:
+            return None
+        stat = path.stat()
+        return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+    run_config = {
+        "audio": fingerprint(audio),
+        "reference": fingerprint(reference),
+        "first_frame": fingerprint(first_frame),
+        "foreground_mask": fingerprint(foreground_mask),
+        "shot_manifest": fingerprint(shot_manifest),
+        "prompt": args.prompt,
+        "model": args.model,
+        "gemma": args.gemma,
+        "lora": lora_spec,
+        "base_face_lora": base_face_lora,
+        "extra_loras": extra_loras,
+        "height": args.height,
+        "width": args.width,
+        "frame_rate": args.frame_rate,
+        "quality": args.quality,
+        "reference_scale": args.reference_scale,
+        "first_frame_strength": args.first_frame_strength,
+        "segment_handoff": args.segment_handoff,
+        "handoff_fade_frames": args.handoff_fade_frames,
+        "transition": args.transition,
+        "segment_preroll_frames": args.segment_preroll_frames,
+        "preencode_audio": args.preencode_audio,
+        "latent_upscale": "official_two_stage_spatial_upscaler",
+        "lighting_match": args.lighting_match,
+        "lighting_match_max": args.lighting_match_max,
+        "mask_feather": args.mask_feather,
+        "seed": args.seed,
+        "plans": serialise_plan(plans),
+    }
+    run_hash = stable_config_hash(run_config)
+    (work_dir / f"run-{run_hash}.json").write_text(
+        json.dumps(run_config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"Best Face long video: {duration:.1f}s, {len(plans)} shots, run {run_hash}")
+    print("Original TTS will be locked for lip-sync; all model-generated audio will be discarded.")
+    if foreground_mask is None:
+        print("Background: anchored by the master first frame (supply --foreground-mask for pixel locking).")
+    else:
+        print("Background: pixel-locked outside the supplied foreground mask.")
+
+    pipe: BestFacePipeline | None = None
+    preencoded_audio: dict[int, object] = {}
+    audio_preencoded = False
+    visuals: list[Path] = []
+    started = time.time()
+
+    for plan in plans:
+        override = overrides.get(plan.index, {})
+        segment_prompt = str(override.get("prompt", args.prompt)).strip()
+        if not args.no_scene_lock_prompt:
+            segment_prompt = f"{segment_prompt} {SCENE_LOCK}"
+        override_frame = override.get("first_frame")
+        if override_frame is not None:
+            segment_frame = Path(override_frame).expanduser().resolve()
+        elif plan.index > 0 and args.segment_handoff == "previous":
+            previous_visual = visuals[-1]
+            # The previous visual stem includes its config hash, preventing a
+            # stale handoff image from being reused after prompt/seed changes.
+            segment_frame = handoff_dir / f"{previous_visual.stem}-handoff.png"
+            if not segment_frame.is_file():
+                _extract_last_frame(previous_visual, segment_frame)
+        else:
+            segment_frame = first_frame
+        segment_mask_raw = override.get("foreground_mask", foreground_mask)
+        segment_mask = Path(segment_mask_raw).expanduser().resolve() if segment_mask_raw else None
+        segment_seed = int(override.get("seed", args.seed + plan.index))
+        use_master_preroll = (
+            plan.index > 0
+            and (args.segment_handoff == "master" or override_frame is not None)
+        )
+        window = build_conditioning_window(
+            plan,
+            frame_rate=args.frame_rate,
+            preroll_frames=args.segment_preroll_frames if use_master_preroll else 0,
+        )
+        if not segment_frame.is_file():
+            raise FileNotFoundError(f"segment {plan.index} first frame does not exist: {segment_frame}")
+        if segment_mask is not None and not segment_mask.is_file():
+            raise FileNotFoundError(f"segment {plan.index} mask does not exist: {segment_mask}")
+
+        segment_config = {
+            **asdict(plan),
+            "conditioning_window": asdict(window),
+            "prompt": segment_prompt,
+            "first_frame": fingerprint(segment_frame),
+            "foreground_mask": fingerprint(segment_mask),
+            "seed": segment_seed,
+            "run": run_hash,
+        }
+        segment_hash = stable_config_hash(segment_config, length=10)
+        stem = f"segment-{plan.index:04d}-{segment_hash}"
+        chunk_audio = audio_dir / f"{stem}.wav"
+        raw_video = raw_dir / f"{stem}.mp4"
+        visual_video = visual_dir / f"{stem}.mp4"
+
+        if not chunk_audio.is_file():
+            conditioning_plan = SegmentPlan(
+                index=plan.index,
+                start_time=window.start_time,
+                source_duration=window.source_duration,
+                num_frames=window.num_frames,
+                output_duration=window.output_duration,
+            )
+            _extract_padded_pcm(
+                source=audio,
+                plan=conditioning_plan,
+                destination=chunk_audio,
+            )
+
+        if not raw_video.is_file():
+            if pipe is None:
+                pipe = BestFacePipeline(
+                    model_dir=args.model,
+                    gemma_model_id=args.gemma,
+                    best_face_lora=lora_spec,
+                    best_face_strength=args.best_face_strength,
+                    base_face_lora=base_face_lora,
+                    base_face_strength=args.base_face_strength,
+                    spatial_upscaler=spatial_upscaler,
+                    extra_loras=extra_loras,
+                    low_memory=args.low_memory,
+                )
+            if args.preencode_audio and not audio_preencoded:
+                print(f"Pre-encoding {len(plans)} audio conditioning windows ...")
+                for future_plan in plans:
+                    future_override = overrides.get(future_plan.index, {})
+                    future_uses_master_preroll = (
+                        future_plan.index > 0
+                        and (
+                            args.segment_handoff == "master"
+                            or future_override.get("first_frame") is not None
+                        )
+                    )
+                    future_window = build_conditioning_window(
+                        future_plan,
+                        frame_rate=args.frame_rate,
+                        preroll_frames=(
+                            args.segment_preroll_frames
+                            if future_uses_master_preroll
+                            else 0
+                        ),
+                    )
+                    preencoded_audio[future_plan.index] = pipe.preencode_locked_audio(
+                        str(audio),
+                        num_frames=future_window.num_frames,
+                        frame_rate=args.frame_rate,
+                        start_time=future_window.start_time,
+                        max_duration=future_window.source_duration,
+                    )
+                audio_preencoded = True
+                print("Audio conditioning cache ready.")
+            print(
+                f"[{plan.index + 1}/{len(plans)}] generating "
+                f"{window.output_duration:.2f}s "
+                f"({window.preroll_frames} preroll frames)"
+            )
+            pipe.generate_and_save_best_face(
+                prompt=segment_prompt,
+                reference=str(reference),
+                output_path=str(raw_video),
+                height=args.height,
+                width=args.width,
+                num_frames=window.num_frames,
+                frame_rate=args.frame_rate,
+                seed=segment_seed,
+                resize_mode=resize_mode,
+                reference_scale=args.reference_scale,
+                stage1_steps=7 if args.quality == "balanced" else None,
+                stage2_steps=3 if args.quality == "balanced" else None,
+                fast_refine=args.quality == "balanced",
+                ugc_fast=args.quality == "fast",
+                ugc_ultrafast=args.quality == "ultrafast",
+                first_frame=str(segment_frame),
+                first_frame_strength=args.first_frame_strength,
+                first_frame_mode="appearance",
+                keyframe_layout_blur=args.keyframe_layout_blur,
+                audio_path=str(chunk_audio),
+                audio_start_time=0.0,
+                audio_max_duration=window.output_duration,
+                locked_audio_tokens=preencoded_audio.get(plan.index),
+            )
+        else:
+            print(f"[{plan.index + 1}/{len(plans)}] resuming existing shot")
+
+        if not visual_video.is_file():
+            needs_handoff_blend = (
+                plan.index > 0
+                and args.segment_handoff == "previous"
+                and override_frame is None
+                and args.transition == "fade"
+                and args.handoff_fade_frames > 0
+            )
+            base_visual = (
+                visual_dir / f"{stem}.unblended.mp4"
+                if needs_handoff_blend
+                else visual_video
+            )
+            if not base_visual.is_file():
+                brightness_correction = 0.0
+                if args.lighting_match and args.lighting_match_max > 0:
+                    analysis_frame = visual_dir / f"{stem}.lighting.png"
+                    if not analysis_frame.is_file():
+                        _extract_analysis_frame(
+                            raw_video,
+                            analysis_frame,
+                            frame_index=window.preroll_frames,
+                        )
+                    brightness_correction = _measure_brightness_correction(
+                        master_frame=segment_frame,
+                        generated_frame=analysis_frame,
+                        foreground_mask=segment_mask,
+                        maximum=args.lighting_match_max,
+                    )
+                    print(
+                        f"[{plan.index + 1}/{len(plans)}] lighting correction "
+                        f"{brightness_correction:+.4f}"
+                    )
+                if segment_mask is None:
+                    _normalise_video(
+                        raw_video,
+                        base_visual,
+                        frame_rate=args.frame_rate,
+                        duration=plan.source_duration,
+                        trim_start_frames=window.preroll_frames,
+                        brightness_correction=brightness_correction,
+                    )
+                else:
+                    _lock_background(
+                        generated=raw_video,
+                        background=segment_frame,
+                        foreground_mask=segment_mask,
+                        destination=base_visual,
+                        width=args.width,
+                        height=args.height,
+                        frame_rate=args.frame_rate,
+                        duration=plan.source_duration,
+                        mask_feather=args.mask_feather,
+                        trim_start_frames=window.preroll_frames,
+                        brightness_correction=brightness_correction,
+                    )
+            if needs_handoff_blend:
+                _soften_segment_start(
+                    generated=base_visual,
+                    handoff_frame=segment_frame,
+                    destination=visual_video,
+                    width=args.width,
+                    height=args.height,
+                    frame_rate=args.frame_rate,
+                    duration=plan.source_duration,
+                    fade_frames=args.handoff_fade_frames,
+                )
+        visuals.append(visual_video)
+
+    _assemble(
+        visual_segments=visuals,
+        original_audio=audio,
+        work_dir=work_dir,
+        output=output,
+    )
+    summary = {
+        **run_config,
+        "output": str(output),
+        "work_dir": str(work_dir),
+        "elapsed_seconds": time.time() - started,
+        "segments": [str(path) for path in visuals],
+        "audio_mode": "direct_original_tts_track",
+        "background_mode": "masked_pixel_lock" if foreground_mask else "first_frame_anchor",
+        "segment_handoff": args.segment_handoff,
+        "transition": args.transition,
+        "segment_preroll_frames": args.segment_preroll_frames,
+        "preencode_audio": args.preencode_audio,
+        "model_residency": "low_memory_reload" if args.low_memory else "warm_across_segments",
+        "latent_upscale": "official_two_stage_spatial_upscaler",
+        "lighting_match": args.lighting_match,
+        "lighting_match_max": args.lighting_match_max,
+    }
+    output.with_suffix(output.suffix + ".json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Saved {output} in {time.time() - started:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = ["main"]

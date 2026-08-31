@@ -46,7 +46,9 @@ uv sync --all-extras
 ## Quick Start
 
 For character-sheet identity conditioning, including the parity and opt-in
-UGC-fast workflows, see [Best Face ID on MLX](docs/BEST_FACE.md).
+UGC-fast workflows, see [Best Face ID on MLX](docs/BEST_FACE.md). For resumable
+multi-minute generation with locked TTS and optional pixel-locked backgrounds,
+see [Best Face long videos](docs/LONG_VIDEO.md).
 
 ### CLI
 
